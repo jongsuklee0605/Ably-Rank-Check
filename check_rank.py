@@ -14,12 +14,15 @@ BRAND_KEYWORDS = ["캔메이크", "canmake"]
 MARKET_URL = "https://mobile.a-bly.com/markets/" + MARKET_ID
 TOP_N = int(os.getenv("TOP_N", "100"))
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"].strip()
+HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 KST = timezone(timedelta(hours=9))
 GOODS_RE = re.compile(r"/goods/(\d+)")
 UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 JS_LINKS = "els => els.map(a => a.href)"
 SCROLL_JS = "() => { window.scrollBy(0, 2500); document.querySelectorAll('*').forEach(el => { const s = getComputedStyle(el).overflowY; if ((s === 'auto' || s === 'scroll') && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollTop + 2500; } }); }"
+STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
+CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser"]
 
 
 def log(msg):
@@ -42,8 +45,26 @@ def is_brand_line(line):
     return False
 
 
+def is_challenge(page):
+    try:
+        t = page.title().lower()
+    except Exception:
+        return False
+    for w in CHALLENGE_WORDS:
+        if w in t:
+            return True
+    return False
+
+
+def wait_challenge(page, seconds):
+    for _ in range(seconds):
+        if not is_challenge(page):
+            return True
+        page.wait_for_timeout(1000)
+    return not is_challenge(page)
+
+
 def load_rankings():
-    """RANKINGS 환경변수: 한 줄에 하나씩 '이름|URL|클릭할탭' 형식"""
     rankings = []
     raw = os.getenv("RANKINGS", "")
     for line in raw.splitlines():
@@ -60,8 +81,6 @@ def load_rankings():
 
 
 class Collector:
-    """페이지가 서버에서 받아오는 JSON에서 상품 정보를 수집"""
-
     def __init__(self):
         self.reset()
 
@@ -109,7 +128,6 @@ class Collector:
 
 
 def parse_text_ranks(text, found):
-    """화면 글자에서 '순위숫자 ... 캔메이크 / 상품명' 패턴을 찾아 found[순위] = 상품명 으로 저장"""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     last_rank = None
     for i, line in enumerate(lines):
@@ -121,8 +139,8 @@ def parse_text_ranks(text, found):
                 found[last_rank] = name
 
 
-def open_and_collect(browser, url, limit, max_scroll, screenshot, tab):
-    page = browser.new_page(viewport={"width": 430, "height": 932}, user_agent=UA, locale="ko-KR")
+def open_and_collect(context, url, limit, max_scroll, screenshot, tab):
+    page = context.new_page()
     col = Collector()
     page.on("response", col.on_response)
     dom_ids = []
@@ -130,12 +148,18 @@ def open_and_collect(browser, url, limit, max_scroll, screenshot, tab):
     log("[open] " + url + (" (탭: " + tab + ")" if tab else ""))
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(6000)
+        page.wait_for_timeout(3000)
+        if is_challenge(page):
+            log("[challenge] 봇 확인 화면 감지 - 통과 대기")
+            if not wait_challenge(page, 30):
+                raise RuntimeError("에이블리 봇 확인 화면(Cloudflare)을 통과하지 못했습니다.")
+            log("[challenge] 통과")
+        page.wait_for_timeout(4000)
         log("[loaded] title=" + page.title())
 
         if tab:
             col.reset()
-            page.get_by_text(tab, exact=True).first.click()
+            page.get_by_text(tab, exact=True).first.click(timeout=15000)
             page.wait_for_timeout(5000)
             log("[tab] '" + tab + "' 클릭 완료")
 
@@ -203,9 +227,9 @@ def get_ranking_ids(dom_ids, col):
     return [it["id"] for it in groups[best]][:TOP_N], "API " + best
 
 
-def check_one(browser, rk, brand_ids, idx):
+def check_one(context, rk, brand_ids, idx):
     shot = "debug_ranking_" + str(idx) + ".png"
-    dom_ids, col, text_ranks = open_and_collect(browser, rk["url"], TOP_N, 30, shot, rk["tab"])
+    dom_ids, col, text_ranks = open_and_collect(context, rk["url"], TOP_N, 30, shot, rk["tab"])
     log_groups(rk["name"], col)
 
     ranking, source = get_ranking_ids(dom_ids, col)
@@ -261,22 +285,24 @@ def main():
     sections = []
     any_hit = False
     fail_count = 0
+    brand_ids = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(viewport={"width": 430, "height": 932}, user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", is_mobile=True, has_touch=True)
+        context.add_init_script(STEALTH_JS)
         try:
             try:
-                b_dom, b_col, _ = open_and_collect(browser, MARKET_URL, 1000, 40, "debug_market.png", "")
+                b_dom, b_col, _ = open_and_collect(context, MARKET_URL, 1000, 40, "debug_market.png", "")
                 log_groups("brand", b_col)
                 brand_ids = get_brand_ids(b_dom, b_col)
             except Exception:
                 traceback.print_exc()
-                brand_ids = set()
             log("[brand] 캔메이크 상품 " + str(len(brand_ids)) + "개 확보")
 
             for idx, rk in enumerate(rankings, start=1):
                 try:
-                    hits, checked = check_one(browser, rk, brand_ids, idx)
+                    hits, checked = check_one(context, rk, brand_ids, idx)
                     if hits:
                         any_hit = True
                     if checked == 0 and not hits:
@@ -285,7 +311,7 @@ def main():
                 except Exception as e:
                     traceback.print_exc()
                     fail_count += 1
-                    sections.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e)[:150])
+                    sections.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e).split("\n")[0][:150])
         finally:
             browser.close()
 

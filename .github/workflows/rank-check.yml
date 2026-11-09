@@ -29,8 +29,8 @@ jobs:
           BRAND_NAME: "Canmake"
           TOP_N: "100"
           RANKINGS: |
-            전체 랭킹|https://mobile.a-bly.com/ranking|All
-            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티
+            전체 랭킹|https://mobile.a-bly.com/ranking||100
+            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100
 
       - name: Upload debug screenshots
         if: always()

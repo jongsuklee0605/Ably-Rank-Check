@@ -1,0 +1,40 @@
+name: Canmake Ably Rank Check
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check ranking
+        run: python check_rank.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RANKING_URL: ${{ secrets.RANKING_URL }}
+          MARKET_ID: "116160"
+          BRAND_NAME: "Canmake"
+          TOP_N: "100"
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug_*.png
+          if-no-files-found: ignore
+          retention-days: 3

@@ -20,6 +20,8 @@ SCROLL_JS = "() => { window.scrollBy(0, 1800); document.querySelectorAll('*').fo
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
 CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser"]
 VERIFY_WORDS = {"뷰티": ["스킨케어", "포인트 메이크업", "베이스 메이크업"]}
+MAIN_URL = "https://mobile.a-bly.com/"
+OPEN_RETRY = 3
 
 
 def log(msg):
@@ -56,6 +58,36 @@ def pass_challenge(page):
             log("[challenge] 통과")
             return
     raise RuntimeError("에이블리 봇 확인 화면(Cloudflare)을 통과하지 못했습니다.")
+
+
+def open_with_retry(page, url):
+    """페이지 접속 + 봇 확인 통과를 최대 OPEN_RETRY번 시도"""
+    for attempt in range(1, OPEN_RETRY + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            pass_challenge(page)
+            if attempt > 1:
+                log("[retry] " + str(attempt) + "회차에 접속 성공")
+            return
+        except Exception as e:
+            log("[retry] " + str(attempt) + "/" + str(OPEN_RETRY) + " 접속 실패: " + str(e).split("\n")[0][:80])
+            if attempt == OPEN_RETRY:
+                raise
+            page.wait_for_timeout(5000)
+
+
+def warm_up(context):
+    """랭킹 확인 전에 메인 페이지에 들러 봇 확인을 미리 통과해 둔다"""
+    page = context.new_page()
+    try:
+        log("[warmup] 에이블리 메인 페이지 접속")
+        open_with_retry(page, MAIN_URL)
+        page.wait_for_timeout(3000)
+        log("[warmup] 완료 title=" + page.title())
+    except Exception as e:
+        log("[warmup] 실패(무시하고 진행): " + str(e).split("\n")[0][:80])
+    finally:
+        page.close()
 
 
 def load_rankings():
@@ -122,8 +154,7 @@ def click_category(page, tab, url):
         if ok_url and ok_words:
             return True
         if not ok_url:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            pass_challenge(page)
+            open_with_retry(page, url)
             page.wait_for_timeout(3000)
     return False
 
@@ -134,8 +165,7 @@ def check_one(context, rk, idx):
     max_seen = 0
     log("[open] " + rk["name"] + " : " + rk["url"] + (" (카테고리: " + rk["tab"] + ")" if rk["tab"] else ""))
     try:
-        page.goto(rk["url"], wait_until="domcontentloaded", timeout=45000)
-        pass_challenge(page)
+        open_with_retry(page, rk["url"])
         page.wait_for_timeout(4000)
         log("[loaded] title=" + page.title())
 
@@ -210,6 +240,7 @@ def main():
         context = browser.new_context(viewport={"width": 430, "height": 932}, user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", is_mobile=True, has_touch=True)
         context.add_init_script(STEALTH_JS)
         try:
+            warm_up(context)
             for idx, rk in enumerate(rankings, start=1):
                 try:
                     hits, max_seen = check_one(context, rk, idx)

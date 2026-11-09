@@ -25,10 +25,12 @@ jobs:
         run: python check_rank.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          RANKING_URL: ${{ secrets.RANKING_URL }}
           MARKET_ID: "116160"
           BRAND_NAME: "Canmake"
           TOP_N: "100"
+          RANKINGS: |
+            전체 랭킹|https://mobile.a-bly.com/ranking|All
+            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티
 
       - name: Upload debug screenshots
         if: always()

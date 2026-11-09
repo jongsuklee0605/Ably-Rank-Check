@@ -22,7 +22,7 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Check ranking
-        run: python check_rank.py
+        run: xvfb-run -a python check_rank.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           MARKET_ID: "116160"

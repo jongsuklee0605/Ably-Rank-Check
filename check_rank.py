@@ -3,11 +3,13 @@ import re
 import sys
 import traceback
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from playwright.sync_api import sync_playwright
 
 BRAND_NAME = os.getenv("BRAND_NAME", "Canmake")
+REPORT_TITLE = os.getenv("REPORT_TITLE", "에이블리 랭킹 체크")
 BRAND_KEYWORDS = ["캔메이크", "canmake"]
 DEFAULT_TOP_N = int(os.getenv("TOP_N", "100"))
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"].strip()
@@ -22,6 +24,7 @@ CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required",
 VERIFY_WORDS = {"뷰티": ["스킨케어", "포인트 메이크업", "베이스 메이크업"]}
 MAIN_URL = "https://mobile.a-bly.com/"
 OPEN_RETRY = 3
+TAB_MAX_Y = 800  # 이 높이(px)보다 위에 있는 텍스트만 카테고리 후보로 봄
 
 
 def log(msg):
@@ -60,210 +63,4 @@ def pass_challenge(page):
     raise RuntimeError("에이블리 봇 확인 화면(Cloudflare)을 통과하지 못했습니다.")
 
 
-def open_with_retry(page, url):
-    """페이지 접속 + 봇 확인 통과를 최대 OPEN_RETRY번 시도"""
-    for attempt in range(1, OPEN_RETRY + 1):
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            pass_challenge(page)
-            if attempt > 1:
-                log("[retry] " + str(attempt) + "회차에 접속 성공")
-            return
-        except Exception as e:
-            log("[retry] " + str(attempt) + "/" + str(OPEN_RETRY) + " 접속 실패: " + str(e).split("\n")[0][:80])
-            if attempt == OPEN_RETRY:
-                raise
-            page.wait_for_timeout(5000)
-
-
-def warm_up(context):
-    """랭킹 확인 전에 메인 페이지에 들러 봇 확인을 미리 통과해 둔다"""
-    page = context.new_page()
-    try:
-        log("[warmup] 에이블리 메인 페이지 접속")
-        open_with_retry(page, MAIN_URL)
-        page.wait_for_timeout(3000)
-        log("[warmup] 완료 title=" + page.title())
-    except Exception as e:
-        log("[warmup] 실패(무시하고 진행): " + str(e).split("\n")[0][:80])
-    finally:
-        page.close()
-
-
-def load_rankings():
-    """RANKINGS: 한 줄에 '이름|URL|클릭할카테고리|TOP_N' (카테고리, TOP_N은 생략 가능)"""
-    rankings = []
-    for line in os.getenv("RANKINGS", "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [x.strip() for x in line.split("|")]
-        while len(parts) < 4:
-            parts.append("")
-        top_n = int(parts[3]) if parts[3].isdigit() else DEFAULT_TOP_N
-        rankings.append({"name": parts[0], "url": parts[1], "tab": parts[2], "top_n": top_n})
-    return rankings
-
-
-def parse_text(text, hits):
-    """'순위숫자 ... 캔메이크 / 상품명' 패턴에서 hits[순위] = 상품명 저장, 화면에서 본 최대 순위 반환"""
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    last_rank = None
-    max_rank = 0
-    for i, line in enumerate(lines):
-        if RANK_RE.match(line):
-            last_rank = int(line)
-            if last_rank > max_rank:
-                max_rank = last_rank
-        elif last_rank is not None and is_brand_line(line):
-            name = lines[i + 1] if i + 1 < len(lines) else ""
-            if last_rank not in hits:
-                hits[last_rank] = name
-    return max_rank
-
-
-def click_category(page, tab, url):
-    """상단 메뉴가 아닌 랭킹 화면 안의 카테고리를 클릭하고, 제대로 선택됐는지 검증"""
-    loc = page.get_by_text(tab, exact=True)
-    cands = []
-    for i in range(loc.count()):
-        try:
-            el = loc.nth(i)
-            if not el.is_visible():
-                continue
-            box = el.bounding_box()
-            if box and box["y"] < 700:
-                cands.append((box["y"], i))
-        except Exception:
-            continue
-    log("[tab] '" + tab + "' 후보 " + str(len(cands)) + "개: " + str([round(c[0]) for c in cands]))
-    cands.sort(reverse=True)
-
-    verify = VERIFY_WORDS.get(tab, [])
-    for y, i in cands:
-        try:
-            page.get_by_text(tab, exact=True).nth(i).click(timeout=10000)
-            page.wait_for_timeout(4000)
-        except Exception as e:
-            log("[tab] 클릭 실패 y=" + str(round(y)) + " : " + str(e).split("\n")[0])
-            continue
-        body = page.inner_text("body")
-        ok_url = "/ranking" in page.url
-        ok_words = (not verify) or any(w in body for w in verify)
-        log("[tab] y=" + str(round(y)) + " 클릭 → url=" + page.url + " / 검증=" + str(ok_url and ok_words))
-        if ok_url and ok_words:
-            return True
-        if not ok_url:
-            open_with_retry(page, url)
-            page.wait_for_timeout(3000)
-    return False
-
-
-def check_one(context, rk, idx):
-    page = context.new_page()
-    hits = {}
-    max_seen = 0
-    log("[open] " + rk["name"] + " : " + rk["url"] + (" (카테고리: " + rk["tab"] + ")" if rk["tab"] else ""))
-    try:
-        open_with_retry(page, rk["url"])
-        page.wait_for_timeout(4000)
-        log("[loaded] title=" + page.title())
-
-        if rk["tab"]:
-            if not click_category(page, rk["tab"], rk["url"]):
-                raise RuntimeError("'" + rk["tab"] + "' 카테고리를 선택하지 못했습니다.")
-            page.evaluate("() => window.scrollTo(0, 0)")
-            page.wait_for_timeout(1500)
-
-        stale = 0
-        for _ in range(60):
-            m = parse_text(page.inner_text("body"), hits)
-            if m > max_seen:
-                max_seen = m
-                stale = 0
-            else:
-                stale += 1
-            if max_seen >= rk["top_n"] or stale >= 5:
-                break
-            page.evaluate(SCROLL_JS)
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(1300)
-
-        log("[" + rk["name"] + "] 확인한 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
-    finally:
-        try:
-            page.screenshot(path="debug_ranking_" + str(idx) + ".png")
-        except Exception:
-            pass
-        page.close()
-
-    in_range = {}
-    for r, n in hits.items():
-        if r <= rk["top_n"]:
-            in_range[r] = n
-    return in_range, max_seen
-
-
-def format_section(rk, hits, max_seen):
-    name = rk["name"]
-    if hits:
-        lines = ["*[" + name + "]* :tada: " + str(len(hits)) + "개 진입"]
-        for r in sorted(hits):
-            lines.append("• *" + str(r) + "위* " + str(hits[r])[:45])
-        return "\n".join(lines)
-    if max_seen == 0:
-        return "*[" + name + "]* :warning: 순위를 읽지 못했습니다. (스크린샷 확인 필요)"
-    if max_seen < rk["top_n"]:
-        return "*[" + name + "]* 진입 없음 (TOP " + str(max_seen) + "까지만 확인됨)"
-    return "*[" + name + "]* 진입 없음 (TOP " + str(rk["top_n"]) + " 기준)"
-
-
-def send_slack(text):
-    res = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
-    log("[slack] " + str(res.status_code) + " " + res.text)
-    res.raise_for_status()
-
-
-def main():
-    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    rankings = load_rankings()
-    if not rankings:
-        send_slack(":warning: [" + now + "] RANKINGS 설정이 비어 있습니다.")
-        sys.exit(1)
-
-    sections = []
-    any_hit = False
-    fail_count = 0
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(viewport={"width": 430, "height": 932}, user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", is_mobile=True, has_touch=True)
-        context.add_init_script(STEALTH_JS)
-        try:
-            warm_up(context)
-            for idx, rk in enumerate(rankings, start=1):
-                try:
-                    hits, max_seen = check_one(context, rk, idx)
-                    if hits:
-                        any_hit = True
-                    if max_seen == 0 and not hits:
-                        fail_count += 1
-                    sections.append(format_section(rk, hits, max_seen))
-                except Exception as e:
-                    traceback.print_exc()
-                    fail_count += 1
-                    sections.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e).split("\n")[0][:150])
-        finally:
-            browser.close()
-
-    head = ":tada:" if any_hit else ":mag:"
-    msg = head + " [" + now + "] " + BRAND_NAME + " 에이블리 랭킹 체크\n" + "\n".join(sections)
-    log(msg)
-    send_slack(msg)
-
-    if fail_count == len(rankings):
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+def

@@ -1,42 +1,22 @@
-name: Canmake Ably Rank Check
+      - name: Install Python deps
+        run: pip install -r requirements.txt
 
-on:
-  schedule:
-    - cron: "0 * * * *"
-  workflow_dispatch:
-
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
         with:
-          python-version: "3.12"
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Install dependencies
+      - name: Install Chromium
+        run: python -m playwright install chromium
+
+      - name: Install system deps (best effort)
+        continue-on-error: true
+        timeout-minutes: 4
         run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-      - name: Check ranking
-        run: xvfb-run -a python check_rank.py
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          MARKET_ID: "116160"
-          BRAND_NAME: "Canmake"
-          TOP_N: "100"
-          RANKINGS: |
-            전체 랭킹|https://mobile.a-bly.com/ranking||100
-            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100
-
-      - name: Upload debug screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots
-          path: debug_*.png
-          if-no-files-found: ignore
-          retention-days: 3
+          for i in 1 2 3; do
+            python -m playwright install-deps chromium && exit 0
+            echo "install-deps failed (attempt $i), retrying..."
+            sleep 15
+          done
+          exit 1

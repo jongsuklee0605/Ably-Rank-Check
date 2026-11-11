@@ -18,12 +18,21 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: |
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries
+          echo 'Acquire::http::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/80-retries
+
           pip install -r requirements.txt
           python -m playwright install chromium
-          # 한글 폰트(스크린샷용) - 실패해도 진행
-          timeout 90 sudo apt-get install -y --no-install-recommends fonts-nanum || echo "한글 폰트 설치 생략"
+
+          ok=0
+          for i in 1 2 3; do
+            if python -m playwright install-deps chromium; then ok=1; break; fi
+            echo "install-deps 실패 ($i/3) - 30초 후 재시도"
+            sleep 30
+          done
+          [ "$ok" = 1 ]
 
       - name: Check ranking
         run: xvfb-run -a python check_rank.py
@@ -36,9 +45,14 @@ jobs:
             뷰티랭킹 전체|https://mobile.a-bly.com/screens?screen_name=BEAUTY_RANKING&next_token=eyJiZWF1dHlfcmFua2luZ190eXBlIjogMX0%3D||100
             뷰티랭킹 포인트 메이크업|https://mobile.a-bly.com/screens?screen_name=BEAUTY_RANKING&next_token=eyJiZWF1dHlfcmFua2luZ190eXBlIjogMX0%3D|포인트 메이크업|100
             뷰티랭킹 베이스 메이크업|https://mobile.a-bly.com/screens?screen_name=BEAUTY_RANKING&next_token=eyJiZWF1dHlfcmFua2luZ190eXBlIjogMX0%3D|베이스 메이크업|100
-
+           
       - name: Upload debug files
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: beauty-debug-files
+          path: |
+            debug_*.png
+            debug_*.txt
+          if-no-files-found: ignore
+          retention-days: 3

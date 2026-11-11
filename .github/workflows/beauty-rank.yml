@@ -18,21 +18,12 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        timeout-minutes: 8
+        timeout-minutes: 5
         run: |
-          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries
-          echo 'Acquire::http::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/80-retries
-
           pip install -r requirements.txt
           python -m playwright install chromium
-
-          ok=0
-          for i in 1 2 3; do
-            if python -m playwright install-deps chromium; then ok=1; break; fi
-            echo "install-deps 실패 ($i/3) - 30초 후 재시도"
-            sleep 30
-          done
-          [ "$ok" = 1 ]
+          # 한글 폰트(스크린샷용) - 실패해도 진행
+          timeout 90 sudo apt-get install -y --no-install-recommends fonts-nanum || echo "한글 폰트 설치 생략"
 
       - name: Check ranking
         run: xvfb-run -a python check_rank.py
@@ -56,8 +47,3 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: beauty-debug-files
-          path: |
-            debug_*.png
-            debug_*.txt
-          if-no-files-found: ignore
-          retention-days: 3

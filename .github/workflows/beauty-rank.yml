@@ -7,7 +7,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -15,11 +15,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
+        timeout-minutes: 8
         run: |
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries
+          echo 'Acquire::http::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/80-retries
+
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          python -m playwright install chromium
+
+          ok=0
+          for i in 1 2 3; do
+            if python -m playwright install-deps chromium; then ok=1; break; fi
+            echo "install-deps 실패 ($i/3) - 30초 후 재시도"
+            sleep 30
+          done
+          [ "$ok" = 1 ]
 
       - name: Check ranking
         run: xvfb-run -a python check_rank.py

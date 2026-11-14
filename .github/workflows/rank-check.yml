@@ -8,7 +8,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +46,9 @@ jobs:
           MARKET_ID: "116160"
           BRAND_NAME: "Canmake"
           TOP_N: "100"
+          STALE_SEC: "120"
+          MAX_SEC: "360"
+          SCAN_TRIES: "1"
           RANKINGS: |
             전체 랭킹|https://mobile.a-bly.com/ranking||100
             뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100

@@ -1,7 +1,6 @@
 import os
 import re
 import sys
-import json
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -17,10 +16,11 @@ DEFAULT_TOP_N = int(os.getenv("TOP_N", "100"))
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"].strip()
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
-# API 수집 설정
-MARKET_ID = os.getenv("MARKET_ID", "").strip()
-API_KEYWORD = os.getenv("API_KEYWORD", "").strip()           # 랭킹 API 주소의 일부 (찾은 뒤 입력)
-USE_API = os.getenv("USE_API", "false").lower() == "true"    # true면 API 결과로 순위 판정
+# 모바일 기기 에뮬레이션 설정
+#   안드로이드: BROWSER=chromium, DEVICE="Pixel 7" (또는 "Galaxy S9+")
+#   아이폰   : BROWSER=webkit,   DEVICE="iPhone 14"
+BROWSER = os.getenv("BROWSER", "chromium").strip().lower()
+DEVICE = os.getenv("DEVICE", "Pixel 7").strip()
 
 # 로딩 대기 설정 (사이트가 느릴 때를 대비해 넉넉하게)
 STALE_SEC = int(os.getenv("STALE_SEC", "120"))   # 새 순위가 이 시간 동안 안 늘면 포기
@@ -30,11 +30,13 @@ NUDGE_EVERY = 10                                 # 로딩 멈춤 시 위아래 �
 
 KST = timezone(timedelta(hours=9))
 RANK_RE = re.compile(r"^\d{1,3}$")
-UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 SCROLL_JS = "() => { window.scrollBy(0, 1800); document.querySelectorAll('*').forEach(el => { const s = getComputedStyle(el).overflowY; if ((s === 'auto' || s === 'scroll') && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollTop + 1800; } }); }"
-STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
+STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']});"
+STEALTH_JS_CHROME = "window.chrome = {runtime: {}};"
 CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser"]
 VERIFY_WORDS = {"뷰티": ["스킨케어", "포인트 메이크업", "베이스 메이크업"]}
+# 앱 설치 유도 팝업 등에서 누를 버튼 문구 (스크린샷 보고 필요하면 추가)
+POPUP_TEXTS = ["오늘 하루 보지 않기", "다음에 할게요", "괜찮아요", "웹으로 볼게요", "모바일 웹으로 볼게요", "웹에서 계속하기", "닫기"]
 MAIN_URL = "https://mobile.a-bly.com/"
 OPEN_RETRY = 3
 TAB_MAX_Y = 800
@@ -43,96 +45,6 @@ TAB_MAX_Y = 800
 def log(msg):
     print(msg, flush=True)
 
-
-# ---------------------------------------------------------------------------
-# API 응답 수집 / 분석
-# ---------------------------------------------------------------------------
-
-class ApiCollector:
-    """페이지가 받아오는 JSON(XHR/fetch) 응답을 모아둔다"""
-
-    def __init__(self, page):
-        self.items = []
-        page.on("response", self._on_response)
-
-    def _on_response(self, resp):
-        try:
-            if resp.request.resource_type not in ("xhr", "fetch"):
-                return
-            if "json" not in (resp.headers.get("content-type") or ""):
-                return
-            if API_KEYWORD and API_KEYWORD not in resp.url:
-                return
-            self.items.append((resp.url, resp.json()))
-        except Exception:
-            pass
-
-    def reset(self):
-        self.items = []
-
-    def dump(self, path):
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump([{"url": u, "data": d} for u, d in self.items], f, ensure_ascii=False, indent=1)
-            log("[api] 응답 " + str(len(self.items)) + "개 저장 -> " + path)
-        except Exception as e:
-            log("[api] 저장 실패: " + str(e)[:80])
-
-
-def find_lists(obj):
-    # JSON 안에서 '상품 목록'처럼 보이는 리스트(dict 5개 이상)를 찾는다
-    found = []
-    if isinstance(obj, list):
-        if len(obj) >= 5 and all(isinstance(x, dict) for x in obj):
-            found.append(obj)
-        for x in obj:
-            found.extend(find_lists(x))
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            found.extend(find_lists(v))
-    return found
-
-
-def pick(it, keys):
-    src = it.get("goods") if isinstance(it.get("goods"), dict) else it
-    for k in keys:
-        v = src.get(k)
-        if v not in (None, ""):
-            return v
-    return None
-
-
-def item_is_brand(it):
-    s = json.dumps(it, ensure_ascii=False).lower()
-    if MARKET_ID and re.search(r'"[a-z_]*market[a-z_]*"\s*:\s*"?' + re.escape(MARKET_ID) + r'\b', s):
-        return True
-    return any('"' + k.lower() + '"' in s for k in BRAND_KEYWORDS)
-
-
-def api_ranks(items):
-    hits, seen, order, max_rank = {}, set(), 0, 0
-    for url, data in items:
-        lists = find_lists(data)
-        if not lists:
-            continue
-        goods = max(lists, key=len)
-        for it in goods:
-            key = pick(it, ["sno", "goods_sno", "goods_id", "id"])
-            if key is not None:
-                if key in seen:
-                    continue
-                seen.add(key)
-            order += 1
-            r = it.get("rank") if isinstance(it.get("rank"), int) else order
-            max_rank = max(max_rank, r)
-            if item_is_brand(it) and r not in hits:
-                hits[r] = str(pick(it, ["name", "goods_name", "title"]) or "")
-    return hits, max_rank
-
-
-# ---------------------------------------------------------------------------
-# 페이지 접속 / 화면 파싱
-# ---------------------------------------------------------------------------
 
 def is_brand_line(line):
     t = line.strip().lower()
@@ -166,11 +78,24 @@ def pass_challenge(page):
     raise RuntimeError("에이블리 봇 확인 화면(Cloudflare)을 통과하지 못했습니다.")
 
 
+def close_popups(page):
+    for t in POPUP_TEXTS:
+        try:
+            loc = page.get_by_text(t, exact=True)
+            if loc.count() and loc.first.is_visible():
+                loc.first.click(timeout=2000)
+                log("[popup] '" + t + "' 클릭")
+                page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+
 def open_with_retry(page, url):
     for attempt in range(1, OPEN_RETRY + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             pass_challenge(page)
+            close_popups(page)
             if attempt > 1:
                 log("[retry] " + str(attempt) + "회차에 접속 성공")
             return
@@ -187,11 +112,55 @@ def warm_up(context):
         log("[warmup] 에이블리 메인 페이지 접속")
         open_with_retry(page, MAIN_URL)
         page.wait_for_timeout(3000)
+        close_popups(page)
         log("[warmup] 완료 title=" + page.title())
     except Exception as e:
         log("[warmup] 실패(무시하고 진행): " + str(e).split("\n")[0][:80])
     finally:
         page.close()
+
+
+def get_cdp(context, page):
+    # Chromium이면 실제 터치 스크롤(손가락 쓸기)을 쓰기 위한 세션
+    if BROWSER != "chromium":
+        return None
+    try:
+        return context.new_cdp_session(page)
+    except Exception as e:
+        log("[touch] CDP 세션 실패(일반 스크롤 사용): " + str(e)[:80])
+        return None
+
+
+def do_scroll(page, cdp, dy):
+    # dy > 0 : 아래로, dy < 0 : 위로
+    if cdp:
+        try:
+            vp = page.viewport_size or {"width": 400, "height": 800}
+            step = int(vp["height"] * 0.6)
+            moved = 0
+            while moved < abs(dy):
+                cdp.send("Input.synthesizeScrollGesture", {
+                    "x": vp["width"] // 2,
+                    "y": vp["height"] // 2,
+                    "yDistance": -step if dy > 0 else step,
+                    "speed": 3000,
+                    "gestureSourceType": "touch",
+                })
+                moved += step
+        except Exception:
+            pass
+    try:
+        if dy > 0:
+            page.evaluate(SCROLL_JS)
+        else:
+            page.evaluate("(d) => window.scrollBy(0, d)", dy)
+    except Exception:
+        pass
+    if not cdp:
+        try:
+            page.mouse.wheel(0, dy)
+        except Exception:
+            pass
 
 
 def load_rankings():
@@ -254,16 +223,16 @@ def click_tab(page, tab, url, prev_tabs):
     verify = VERIFY_WORDS.get(tab, [])
     for y, i in cands:
         try:
-            page.get_by_text(tab, exact=True).nth(i).click(timeout=10000)
+            page.get_by_text(tab, exact=True).nth(i).tap(timeout=10000)
             page.wait_for_timeout(4000)
         except Exception as e:
-            log("[tab] 클릭 실패 y=" + str(round(y)) + " : " + str(e).split("\n")[0])
+            log("[tab] 탭 실패 y=" + str(round(y)) + " : " + str(e).split("\n")[0])
             continue
 
         ok_url = same_page(page, url)
         body = page.inner_text("body")
         ok_words = (not verify) or any(w in body for w in verify)
-        log("[tab] '" + tab + "' y=" + str(round(y)) + " 클릭 -> url=" + page.url + " / 검증=" + str(ok_url and ok_words))
+        log("[tab] '" + tab + "' y=" + str(round(y)) + " 탭 -> url=" + page.url + " / 검증=" + str(ok_url and ok_words))
         if ok_url and ok_words:
             return True
 
@@ -282,28 +251,25 @@ def click_tab(page, tab, url, prev_tabs):
     return False
 
 
-def click_categories(page, spec, url, api=None):
+def click_categories(page, spec, url):
     tabs = [t.strip() for t in spec.split(">") if t.strip()]
     for level, tab in enumerate(tabs):
-        if api:
-            api.reset()   # 탭 누르기 전 응답(전체 랭킹 등)은 버림
         if not click_tab(page, tab, url, tabs[:level]):
             raise RuntimeError("'" + tab + "' 카테고리를 선택하지 못했습니다.")
 
 
-def prepare_page(page, rk, api=None):
-    if api:
-        api.reset()
+def prepare_page(page, rk):
     open_with_retry(page, rk["url"])
     page.wait_for_timeout(4000)
+    close_popups(page)
     log("[loaded] title=" + page.title())
     if rk["tab"]:
-        click_categories(page, rk["tab"], rk["url"], api)
+        click_categories(page, rk["tab"], rk["url"])
         page.evaluate("() => window.scrollTo(0, 0)")
         page.wait_for_timeout(1500)
 
 
-def scan(page, rk, hits):
+def scan(page, cdp, rk, hits):
     max_seen = 0
     start = time.time()
     last_progress = start
@@ -329,12 +295,12 @@ def scan(page, rk, hits):
         # 로딩이 멈춘 것 같으면 주기적으로 위로 올렸다 내려서 lazy load 재트리거
         if idle >= 6 and now - last_nudge >= NUDGE_EVERY:
             log("[scan] 대기 중... " + str(int(idle)) + "초째 TOP " + str(max_seen))
-            page.mouse.wheel(0, -2500)
+            close_popups(page)
+            do_scroll(page, cdp, -2500)
             page.wait_for_timeout(800)
             last_nudge = now
 
-        page.evaluate(SCROLL_JS)
-        page.mouse.wheel(0, 1800)
+        do_scroll(page, cdp, 1800)
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
@@ -345,12 +311,12 @@ def scan(page, rk, hits):
 
 def check_one(context, rk, idx):
     page = context.new_page()
-    api = ApiCollector(page)
+    cdp = get_cdp(context, page)
     hits = {}
     max_seen = 0
     log("[open] " + rk["name"] + " : " + rk["url"] + (" (카테고리: " + rk["tab"] + ")" if rk["tab"] else ""))
     try:
-        prepare_page(page, rk, api)
+        prepare_page(page, rk)
 
         try:
             with open("debug_text_" + str(idx) + ".txt", "w", encoding="utf-8") as f:
@@ -359,22 +325,15 @@ def check_one(context, rk, idx):
             pass
 
         for attempt in range(1, SCAN_TRIES + 1):
-            m = scan(page, rk, hits)
+            m = scan(page, cdp, rk, hits)
             if m > max_seen:
                 max_seen = m
             if max_seen >= rk["top_n"] or attempt == SCAN_TRIES:
                 break
             log("[retry-scan] TOP " + str(max_seen) + "까지만 떠서 새로고침 후 재시도")
-            prepare_page(page, rk, api)
+            prepare_page(page, rk)
 
-        log("[" + rk["name"] + "] (화면) 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
-
-        api.dump("debug_api_" + str(idx) + ".json")
-        if API_KEYWORD:
-            api_hits, api_max = api_ranks(api.items)
-            log("[" + rk["name"] + "] (API) 최대 순위=" + str(api_max) + " / 캔메이크=" + str(sorted(api_hits)))
-            if USE_API and api_max > 0:
-                hits, max_seen = api_hits, api_max
+        log("[" + rk["name"] + "] 확인한 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
     finally:
         try:
             page.screenshot(path="debug_ranking_" + str(idx) + ".png")
@@ -388,10 +347,6 @@ def check_one(context, rk, idx):
             in_range[r] = n
     return in_range, max_seen
 
-
-# ---------------------------------------------------------------------------
-# 슬랙 리포트
-# ---------------------------------------------------------------------------
 
 def format_section(rk, hits, max_seen):
     name = rk["name"]
@@ -415,6 +370,23 @@ def send_slack(text):
     res.raise_for_status()
 
 
+def make_context(p):
+    if DEVICE not in p.devices:
+        raise RuntimeError("알 수 없는 DEVICE 이름: " + DEVICE)
+    dev = dict(p.devices[DEVICE])
+    dev.pop("default_browser_type", None)   # new_context에는 넘기면 안 되는 값
+
+    engine = getattr(p, BROWSER)
+    args = ["--disable-blink-features=AutomationControlled"] if BROWSER == "chromium" else []
+    browser = engine.launch(headless=HEADLESS, args=args)
+    context = browser.new_context(**dev, locale="ko-KR", timezone_id="Asia/Seoul")
+    context.add_init_script(STEALTH_JS)
+    if BROWSER == "chromium":
+        context.add_init_script(STEALTH_JS_CHROME)
+    log("[device] " + BROWSER + " / " + DEVICE + " / UA=" + dev.get("user_agent", "")[:80])
+    return browser, context
+
+
 def main():
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     rankings = load_rankings()
@@ -422,16 +394,12 @@ def main():
         send_slack(":warning: [" + now + "] RANKINGS 설정이 비어 있습니다.")
         sys.exit(1)
 
-    log("[config] API_KEYWORD=" + (API_KEYWORD or "(없음)") + " / USE_API=" + str(USE_API) + " / MARKET_ID=" + (MARKET_ID or "(없음)"))
-
     sections = []
     any_hit = False
     fail_count = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(viewport={"width": 430, "height": 932}, user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", is_mobile=True, has_touch=True)
-        context.add_init_script(STEALTH_JS)
+        browser, context = make_context(p)
         try:
             warm_up(context)
             for idx, rk in enumerate(rankings, start=1):

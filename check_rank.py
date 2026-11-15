@@ -22,9 +22,9 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 BROWSER = os.getenv("BROWSER", "chromium").strip().lower()
 DEVICE = os.getenv("DEVICE", "Pixel 7").strip()
 
-# 불필요한 요청 차단 (로딩 속도 개선)
-BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "true").lower() == "true"
-BLOCK_HOSTS = ["amplitude.com"]
+# 불필요한 요청 차단 (통계 전송 서버만 차단, 이미지는 기본 허용)
+BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "false").lower() == "true"
+BLOCK_HOSTS = ["api2.amplitude.com"]
 
 # 로딩 대기 설정 (사이트가 느릴 때를 대비해 넉넉하게)
 STALE_SEC = int(os.getenv("STALE_SEC", "120"))   # 새 순위가 이 시간 동안 안 늘면 포기
@@ -38,6 +38,7 @@ SCROLL_JS = "() => { window.scrollBy(0, 1800); document.querySelectorAll('*').fo
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']});"
 STEALTH_JS_CHROME = "window.chrome = {runtime: {}};"
 CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser"]
+AUTH_WORDS = ["인증되지 않은 유저"]
 VERIFY_WORDS = {"뷰티": ["스킨케어", "포인트 메이크업", "베이스 메이크업"]}
 # 앱 설치 유도 팝업 등에서 누를 버튼 문구 (스크린샷 보고 필요하면 추가)
 POPUP_TEXTS = ["오늘 하루 보지 않기", "다음에 할게요", "괜찮아요", "웹으로 볼게요", "모바일 웹으로 볼게요", "웹에서 계속하기", "닫기"]
@@ -82,6 +83,34 @@ def pass_challenge(page):
     raise RuntimeError("에이블리 봇 확인 화면(Cloudflare)을 통과하지 못했습니다.")
 
 
+def fix_auth(page):
+    # '인증되지 않은 유저' 화면이면 새로고침 버튼을 눌러 최대 3번 복구 시도
+    for i in range(3):
+        page.wait_for_timeout(2000)
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            return
+        if not any(w in body for w in AUTH_WORDS):
+            if i > 0:
+                log("[auth] 인증 복구 성공")
+            return
+        log("[auth] '인증되지 않은 유저' 화면 - 새로고침 " + str(i + 1) + "회차")
+        try:
+            btn = page.get_by_text("새로고침", exact=True)
+            if btn.count():
+                btn.first.click(timeout=3000)
+            else:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+        page.wait_for_timeout(5000)
+    raise RuntimeError("에이블리가 '인증되지 않은 유저'로 접속을 막았습니다.")
+
+
 def close_popups(page):
     for t in POPUP_TEXTS:
         try:
@@ -99,6 +128,7 @@ def open_with_retry(page, url):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
             pass_challenge(page)
+            fix_auth(page)
             close_popups(page)
             if attempt > 1:
                 log("[retry] " + str(attempt) + "회차에 접속 성공")
@@ -266,15 +296,21 @@ def click_categories(page, spec, url):
 
 
 def prepare_page(page, rk):
+    rk.pop("clicked_at", None)
     open_with_retry(page, rk["url"])
     page.wait_for_timeout(4000)
     close_popups(page)
     log("[loaded] title=" + page.title())
+    try:
+        body = page.inner_text("body")
+        log("[body] 글자수=" + str(len(body)) + " / 앞부분: " + body[:150].replace("\n", " | "))
+    except Exception as e:
+        log("[body] 읽기 실패: " + str(e)[:80])
     if rk["tab"]:
         click_categories(page, rk["tab"], rk["url"])
         page.evaluate("() => window.scrollTo(0, 0)")
         page.wait_for_timeout(1500)
-    # 대기 타이머 기준 시점 (탭을 누른 직후)
+    # 대기 타이머 기준 시점 (탭 선택에 성공한 직후에만 기록)
     rk["clicked_at"] = time.time()
 
 
@@ -407,7 +443,7 @@ def setup_blocking(context):
         except Exception:
             pass
     context.route("**/*", handler)
-    log("[block] 통계 요청 차단 / 이미지 차단=" + str(BLOCK_IMAGES))
+    log("[block] 차단 대상=" + str(BLOCK_HOSTS) + " / 이미지 차단=" + str(BLOCK_IMAGES))
 
 
 def make_context(p):
@@ -446,10 +482,10 @@ def main():
         try:
             warm_up(context)
             page = context.new_page()
+            page.on("pageerror", lambda e: log("[js-error] " + str(e)[:150]))
             cdp = get_cdp(context, page)
 
             for idx, rk in enumerate(rankings, start=1):
-                t0 = time.time()
                 try:
                     hits, max_seen = check_one(page, cdp, rk, idx)
                     if hits:
@@ -464,8 +500,10 @@ def main():
 
                 # 다음 랭킹이 있으면, 이 랭킹 탭을 누른 시점부터 wait초가 지날 때까지 대기
                 if rk["wait"] > 0 and idx < len(rankings):
-                    base = rk.get("clicked_at", t0)
-                    wait_until(page, base + rk["wait"], rk["name"] + " 시작 " + str(rk["wait"]) + "초")
+                    if "clicked_at" in rk:
+                        wait_until(page, rk["clicked_at"] + rk["wait"], rk["name"] + " 시작 " + str(rk["wait"]) + "초")
+                    else:
+                        log("[wait] " + rk["name"] + " 탭 선택 실패 - 대기 건너뜀")
         finally:
             browser.close()
 

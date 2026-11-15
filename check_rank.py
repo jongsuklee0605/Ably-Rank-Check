@@ -22,6 +22,10 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 BROWSER = os.getenv("BROWSER", "chromium").strip().lower()
 DEVICE = os.getenv("DEVICE", "Pixel 7").strip()
 
+# 불필요한 요청 차단 (로딩 속도 개선)
+BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "true").lower() == "true"
+BLOCK_HOSTS = ["amplitude.com"]
+
 # 로딩 대기 설정 (사이트가 느릴 때를 대비해 넉넉하게)
 STALE_SEC = int(os.getenv("STALE_SEC", "120"))   # 새 순위가 이 시간 동안 안 늘면 포기
 MAX_SEC = int(os.getenv("MAX_SEC", "360"))       # 랭킹 1회 스캔 최대 시간
@@ -164,17 +168,20 @@ def do_scroll(page, cdp, dy):
 
 
 def load_rankings():
-    # RANKINGS: 한 줄에 '이름|URL|카테고리|TOP_N' (카테고리는 '상위>하위' 형식 가능)
+    # RANKINGS: 한 줄에 '이름|URL|카테고리|TOP_N|대기초'
+    #   카테고리: '상위>하위' 형식 가능, 비우면 탭 안 누름
+    #   대기초  : 이 랭킹의 탭을 누른 시점부터 몇 초가 지나야 다음 랭킹으로 넘어갈지 (비우면 0)
     rankings = []
     for line in os.getenv("RANKINGS", "").splitlines():
         line = line.strip()
         if not line:
             continue
         parts = [x.strip() for x in line.split("|")]
-        while len(parts) < 4:
+        while len(parts) < 5:
             parts.append("")
         top_n = int(parts[3]) if parts[3].isdigit() else DEFAULT_TOP_N
-        rankings.append({"name": parts[0], "url": parts[1], "tab": parts[2], "top_n": top_n})
+        wait = int(parts[4]) if parts[4].isdigit() else 0
+        rankings.append({"name": parts[0], "url": parts[1], "tab": parts[2], "top_n": top_n, "wait": wait})
     return rankings
 
 
@@ -267,6 +274,8 @@ def prepare_page(page, rk):
         click_categories(page, rk["tab"], rk["url"])
         page.evaluate("() => window.scrollTo(0, 0)")
         page.wait_for_timeout(1500)
+    # 대기 타이머 기준 시점 (탭을 누른 직후)
+    rk["clicked_at"] = time.time()
 
 
 def scan(page, cdp, rk, hits):
@@ -309,9 +318,8 @@ def scan(page, cdp, rk, hits):
     return max_seen
 
 
-def check_one(context, rk, idx):
-    page = context.new_page()
-    cdp = get_cdp(context, page)
+def check_one(page, cdp, rk, idx):
+    # 같은 브라우저 탭(page)을 계속 재사용한다
     hits = {}
     max_seen = 0
     log("[open] " + rk["name"] + " : " + rk["url"] + (" (카테고리: " + rk["tab"] + ")" if rk["tab"] else ""))
@@ -339,13 +347,30 @@ def check_one(context, rk, idx):
             page.screenshot(path="debug_ranking_" + str(idx) + ".png")
         except Exception:
             pass
-        page.close()
 
     in_range = {}
     for r, n in hits.items():
         if r <= rk["top_n"]:
             in_range[r] = n
     return in_range, max_seen
+
+
+def wait_until(page, target, label):
+    # target 시각까지 같은 화면을 유지한 채 대기 (1분마다 진행 로그)
+    remain = target - time.time()
+    if remain <= 0:
+        log("[wait] " + label + " 이미 대기 시간 경과 - 바로 다음 랭킹 진행")
+        return
+    log("[wait] " + label + " 후 " + str(int(remain)) + "초 더 대기")
+    while True:
+        remain = target - time.time()
+        if remain <= 0:
+            break
+        page.wait_for_timeout(int(min(60, remain) * 1000))
+        left = int(target - time.time())
+        if left > 0:
+            log("[wait] 남은 시간 " + str(left) + "초")
+    log("[wait] 대기 완료")
 
 
 def format_section(rk, hits, max_seen):
@@ -370,6 +395,21 @@ def send_slack(text):
     res.raise_for_status()
 
 
+def setup_blocking(context):
+    def handler(route):
+        req = route.request
+        try:
+            if any(h in req.url for h in BLOCK_HOSTS):
+                return route.abort()
+            if BLOCK_IMAGES and req.resource_type in ("image", "media", "font"):
+                return route.abort()
+            return route.continue_()
+        except Exception:
+            pass
+    context.route("**/*", handler)
+    log("[block] 통계 요청 차단 / 이미지 차단=" + str(BLOCK_IMAGES))
+
+
 def make_context(p):
     if DEVICE not in p.devices:
         raise RuntimeError("알 수 없는 DEVICE 이름: " + DEVICE)
@@ -380,6 +420,7 @@ def make_context(p):
     args = ["--disable-blink-features=AutomationControlled"] if BROWSER == "chromium" else []
     browser = engine.launch(headless=HEADLESS, args=args)
     context = browser.new_context(**dev, locale="ko-KR", timezone_id="Asia/Seoul")
+    setup_blocking(context)
     context.add_init_script(STEALTH_JS)
     if BROWSER == "chromium":
         context.add_init_script(STEALTH_JS_CHROME)
@@ -394,7 +435,9 @@ def main():
         send_slack(":warning: [" + now + "] RANKINGS 설정이 비어 있습니다.")
         sys.exit(1)
 
-    sections = []
+    log("[plan] 순서: " + " -> ".join(rk["name"] + ("(+" + str(rk["wait"]) + "초)" if rk["wait"] else "") for rk in rankings))
+
+    results = []   # 슬랙에는 RANKINGS 순서 그대로 표시
     any_hit = False
     fail_count = 0
 
@@ -402,23 +445,32 @@ def main():
         browser, context = make_context(p)
         try:
             warm_up(context)
+            page = context.new_page()
+            cdp = get_cdp(context, page)
+
             for idx, rk in enumerate(rankings, start=1):
+                t0 = time.time()
                 try:
-                    hits, max_seen = check_one(context, rk, idx)
+                    hits, max_seen = check_one(page, cdp, rk, idx)
                     if hits:
                         any_hit = True
                     if max_seen == 0 and not hits:
                         fail_count += 1
-                    sections.append(format_section(rk, hits, max_seen))
+                    results.append(format_section(rk, hits, max_seen))
                 except Exception as e:
                     traceback.print_exc()
                     fail_count += 1
-                    sections.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e).split("\n")[0][:150])
+                    results.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e).split("\n")[0][:150])
+
+                # 다음 랭킹이 있으면, 이 랭킹 탭을 누른 시점부터 wait초가 지날 때까지 대기
+                if rk["wait"] > 0 and idx < len(rankings):
+                    base = rk.get("clicked_at", t0)
+                    wait_until(page, base + rk["wait"], rk["name"] + " 시작 " + str(rk["wait"]) + "초")
         finally:
             browser.close()
 
     head = ":tada:" if any_hit else ":mag:"
-    msg = head + " [" + now + "] " + BRAND_NAME + " " + REPORT_TITLE + "\n" + "\n".join(sections)
+    msg = head + " [" + now + "] " + BRAND_NAME + " " + REPORT_TITLE + "\n" + "\n".join(results)
     log(msg)
     send_slack(msg)
 

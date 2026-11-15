@@ -49,15 +49,20 @@ jobs:
           STALE_SEC: "120"
           MAX_SEC: "360"
           SCAN_TRIES: "1"
+          API_KEYWORD: ""      # 1단계 후 랭킹 API 경로 일부 입력
+          USE_API: "false"     # 2단계에서 결과가 맞으면 "true"
           RANKINGS: |
             전체 랭킹|https://mobile.a-bly.com/ranking||100
             뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100
 
-      - name: Upload debug screenshots
+      - name: Upload debug files
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: debug_*.png
+          name: debug-files
+          path: |
+            debug_*.png
+            debug_*.txt
+            debug_api_*.json
           if-no-files-found: ignore
           retention-days: 3

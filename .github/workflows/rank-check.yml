@@ -8,7 +8,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       # 안드로이드: chromium + "Pixel 7"  /  아이폰: webkit + "iPhone 14"
       BROWSER: "chromium"
@@ -53,9 +53,11 @@ jobs:
           STALE_SEC: "120"
           MAX_SEC: "360"
           SCAN_TRIES: "1"
+          BLOCK_IMAGES: "true"
+          # 이름|URL|카테고리|TOP_N|대기초(이 탭을 누른 뒤 몇 초 지나야 다음으로)
           RANKINGS: |
-            전체 랭킹|https://mobile.a-bly.com/ranking||100
-            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100
+            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100|300
+            전체 랭킹|https://mobile.a-bly.com/ranking||100|
 
       - name: Upload debug files
         if: always()

@@ -9,6 +9,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # 안드로이드: chromium + "Pixel 7"  /  아이폰: webkit + "iPhone 14"
+      BROWSER: "chromium"
+      DEVICE: "Pixel 7"
     steps:
       - uses: actions/checkout@v4
 
@@ -23,17 +27,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: playwright-${{ runner.os }}-${{ env.BROWSER }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Install Chromium
-        run: python -m playwright install chromium
+      - name: Install browser
+        run: python -m playwright install "$BROWSER"
 
       - name: Install system deps (best effort)
         continue-on-error: true
         timeout-minutes: 4
         run: |
           for i in 1 2 3; do
-            python -m playwright install-deps chromium && exit 0
+            python -m playwright install-deps "$BROWSER" && exit 0
             echo "install-deps failed (attempt $i), retrying..."
             sleep 15
           done
@@ -49,8 +53,6 @@ jobs:
           STALE_SEC: "120"
           MAX_SEC: "360"
           SCAN_TRIES: "1"
-          API_KEYWORD: ""      # 1단계 후 랭킹 API 경로 일부 입력
-          USE_API: "false"     # 2단계에서 결과가 맞으면 "true"
           RANKINGS: |
             전체 랭킹|https://mobile.a-bly.com/ranking||100
             뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100
@@ -63,6 +65,5 @@ jobs:
           path: |
             debug_*.png
             debug_*.txt
-            debug_api_*.json
           if-no-files-found: ignore
           retention-days: 3

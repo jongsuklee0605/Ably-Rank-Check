@@ -1,0 +1,61 @@
+name: Ably Probe (조합 시험)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "1 크로미움 Pixel7 창",        BROWSER: "chromium", CHANNEL: "",       DEVICE: "Pixel 7",   HEADLESS: "false" }
+          - { label: "2 크로미움 Pixel7 백그라운드", BROWSER: "chromium", CHANNEL: "",       DEVICE: "Pixel 7",   HEADLESS: "true" }
+          - { label: "3 구글크롬 Pixel7 창",        BROWSER: "chromium", CHANNEL: "chrome", DEVICE: "Pixel 7",   HEADLESS: "false" }
+          - { label: "4 크로미움 iPhone14 창",      BROWSER: "chromium", CHANNEL: "",       DEVICE: "iPhone 14", HEADLESS: "false" }
+          - { label: "5 사파리엔진 iPhone14 창",    BROWSER: "webkit",   CHANNEL: "",       DEVICE: "iPhone 14", HEADLESS: "false" }
+          - { label: "6 사파리엔진 iPhone14 백그라운드", BROWSER: "webkit", CHANNEL: "",   DEVICE: "iPhone 14", HEADLESS: "true" }
+    env:
+      BROWSER: ${{ matrix.BROWSER }}
+      CHANNEL: ${{ matrix.CHANNEL }}
+      DEVICE: ${{ matrix.DEVICE }}
+      HEADLESS: ${{ matrix.HEADLESS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Install browser
+        run: |
+          python -m playwright install "$BROWSER"
+          python -m playwright install-deps "$BROWSER" || true
+          if [ -n "$CHANNEL" ]; then python -m playwright install "$CHANNEL"; fi
+
+      - name: Probe
+        run: xvfb-run -a python check_rank.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DRY_RUN: "true"
+          STALE_SEC: "45"
+          MAX_SEC: "90"
+          RANKINGS: |
+            전체 랭킹|https://mobile.a-bly.com/ranking||100|
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ strategy.job-index }}
+          path: |
+            debug_*.png
+            debug_*.txt
+          if-no-files-found: ignore
+          retention-days: 3

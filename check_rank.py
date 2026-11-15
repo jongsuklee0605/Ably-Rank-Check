@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -15,6 +16,11 @@ BRAND_KEYWORDS = ["캔메이크", "canmake"]
 DEFAULT_TOP_N = int(os.getenv("TOP_N", "100"))
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"].strip()
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
+
+# API 수집 설정
+MARKET_ID = os.getenv("MARKET_ID", "").strip()
+API_KEYWORD = os.getenv("API_KEYWORD", "").strip()           # 랭킹 API 주소의 일부 (찾은 뒤 입력)
+USE_API = os.getenv("USE_API", "false").lower() == "true"    # true면 API 결과로 순위 판정
 
 # 로딩 대기 설정 (사이트가 느릴 때를 대비해 넉넉하게)
 STALE_SEC = int(os.getenv("STALE_SEC", "120"))   # 새 순위가 이 시간 동안 안 늘면 포기
@@ -37,6 +43,96 @@ TAB_MAX_Y = 800
 def log(msg):
     print(msg, flush=True)
 
+
+# ---------------------------------------------------------------------------
+# API 응답 수집 / 분석
+# ---------------------------------------------------------------------------
+
+class ApiCollector:
+    """페이지가 받아오는 JSON(XHR/fetch) 응답을 모아둔다"""
+
+    def __init__(self, page):
+        self.items = []
+        page.on("response", self._on_response)
+
+    def _on_response(self, resp):
+        try:
+            if resp.request.resource_type not in ("xhr", "fetch"):
+                return
+            if "json" not in (resp.headers.get("content-type") or ""):
+                return
+            if API_KEYWORD and API_KEYWORD not in resp.url:
+                return
+            self.items.append((resp.url, resp.json()))
+        except Exception:
+            pass
+
+    def reset(self):
+        self.items = []
+
+    def dump(self, path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"url": u, "data": d} for u, d in self.items], f, ensure_ascii=False, indent=1)
+            log("[api] 응답 " + str(len(self.items)) + "개 저장 -> " + path)
+        except Exception as e:
+            log("[api] 저장 실패: " + str(e)[:80])
+
+
+def find_lists(obj):
+    # JSON 안에서 '상품 목록'처럼 보이는 리스트(dict 5개 이상)를 찾는다
+    found = []
+    if isinstance(obj, list):
+        if len(obj) >= 5 and all(isinstance(x, dict) for x in obj):
+            found.append(obj)
+        for x in obj:
+            found.extend(find_lists(x))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            found.extend(find_lists(v))
+    return found
+
+
+def pick(it, keys):
+    src = it.get("goods") if isinstance(it.get("goods"), dict) else it
+    for k in keys:
+        v = src.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def item_is_brand(it):
+    s = json.dumps(it, ensure_ascii=False).lower()
+    if MARKET_ID and re.search(r'"[a-z_]*market[a-z_]*"\s*:\s*"?' + re.escape(MARKET_ID) + r'\b', s):
+        return True
+    return any('"' + k.lower() + '"' in s for k in BRAND_KEYWORDS)
+
+
+def api_ranks(items):
+    hits, seen, order, max_rank = {}, set(), 0, 0
+    for url, data in items:
+        lists = find_lists(data)
+        if not lists:
+            continue
+        goods = max(lists, key=len)
+        for it in goods:
+            key = pick(it, ["sno", "goods_sno", "goods_id", "id"])
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            order += 1
+            r = it.get("rank") if isinstance(it.get("rank"), int) else order
+            max_rank = max(max_rank, r)
+            if item_is_brand(it) and r not in hits:
+                hits[r] = str(pick(it, ["name", "goods_name", "title"]) or "")
+    return hits, max_rank
+
+
+# ---------------------------------------------------------------------------
+# 페이지 접속 / 화면 파싱
+# ---------------------------------------------------------------------------
 
 def is_brand_line(line):
     t = line.strip().lower()
@@ -186,19 +282,23 @@ def click_tab(page, tab, url, prev_tabs):
     return False
 
 
-def click_categories(page, spec, url):
+def click_categories(page, spec, url, api=None):
     tabs = [t.strip() for t in spec.split(">") if t.strip()]
     for level, tab in enumerate(tabs):
+        if api:
+            api.reset()   # 탭 누르기 전 응답(전체 랭킹 등)은 버림
         if not click_tab(page, tab, url, tabs[:level]):
             raise RuntimeError("'" + tab + "' 카테고리를 선택하지 못했습니다.")
 
 
-def prepare_page(page, rk):
+def prepare_page(page, rk, api=None):
+    if api:
+        api.reset()
     open_with_retry(page, rk["url"])
     page.wait_for_timeout(4000)
     log("[loaded] title=" + page.title())
     if rk["tab"]:
-        click_categories(page, rk["tab"], rk["url"])
+        click_categories(page, rk["tab"], rk["url"], api)
         page.evaluate("() => window.scrollTo(0, 0)")
         page.wait_for_timeout(1500)
 
@@ -245,11 +345,12 @@ def scan(page, rk, hits):
 
 def check_one(context, rk, idx):
     page = context.new_page()
+    api = ApiCollector(page)
     hits = {}
     max_seen = 0
     log("[open] " + rk["name"] + " : " + rk["url"] + (" (카테고리: " + rk["tab"] + ")" if rk["tab"] else ""))
     try:
-        prepare_page(page, rk)
+        prepare_page(page, rk, api)
 
         try:
             with open("debug_text_" + str(idx) + ".txt", "w", encoding="utf-8") as f:
@@ -264,9 +365,16 @@ def check_one(context, rk, idx):
             if max_seen >= rk["top_n"] or attempt == SCAN_TRIES:
                 break
             log("[retry-scan] TOP " + str(max_seen) + "까지만 떠서 새로고침 후 재시도")
-            prepare_page(page, rk)
+            prepare_page(page, rk, api)
 
-        log("[" + rk["name"] + "] 확인한 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
+        log("[" + rk["name"] + "] (화면) 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
+
+        api.dump("debug_api_" + str(idx) + ".json")
+        if API_KEYWORD:
+            api_hits, api_max = api_ranks(api.items)
+            log("[" + rk["name"] + "] (API) 최대 순위=" + str(api_max) + " / 캔메이크=" + str(sorted(api_hits)))
+            if USE_API and api_max > 0:
+                hits, max_seen = api_hits, api_max
     finally:
         try:
             page.screenshot(path="debug_ranking_" + str(idx) + ".png")
@@ -280,6 +388,10 @@ def check_one(context, rk, idx):
             in_range[r] = n
     return in_range, max_seen
 
+
+# ---------------------------------------------------------------------------
+# 슬랙 리포트
+# ---------------------------------------------------------------------------
 
 def format_section(rk, hits, max_seen):
     name = rk["name"]
@@ -309,6 +421,8 @@ def main():
     if not rankings:
         send_slack(":warning: [" + now + "] RANKINGS 설정이 비어 있습니다.")
         sys.exit(1)
+
+    log("[config] API_KEYWORD=" + (API_KEYWORD or "(없음)") + " / USE_API=" + str(USE_API) + " / MARKET_ID=" + (MARKET_ID or "(없음)"))
 
     sections = []
     any_hit = False

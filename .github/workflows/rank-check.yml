@@ -44,3 +44,14 @@ jobs:
           RANKINGS: |
             뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100|300
             전체 랭킹|https://mobile.a-bly.com/ranking||100|
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-files
+          path: |
+            debug_*.png
+            debug_*.txt
+          if-no-files-found: ignore
+          retention-days: 3

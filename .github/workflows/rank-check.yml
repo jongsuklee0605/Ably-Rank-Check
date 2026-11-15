@@ -8,11 +8,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      BROWSER: "webkit"
-      CHANNEL: ""
-      DEVICE: "iPhone 14"
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -23,29 +19,41 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Install browser
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Chromium
+        run: python -m playwright install chromium
+
+      - name: Install system deps (best effort)
+        continue-on-error: true
+        timeout-minutes: 4
         run: |
-          python -m playwright install "$BROWSER"
-          python -m playwright install-deps "$BROWSER" || true
-          if [ -n "$CHANNEL" ]; then python -m playwright install "$CHANNEL"; fi
+          for i in 1 2 3; do
+            python -m playwright install-deps chromium && exit 0
+            echo "install-deps failed (attempt $i), retrying..."
+            sleep 15
+          done
+          exit 1
 
       - name: Check ranking
         run: xvfb-run -a python check_rank.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          HEADLESS: "false"
           MARKET_ID: "116160"
           BRAND_NAME: "Canmake"
           TOP_N: "100"
           STALE_SEC: "120"
           MAX_SEC: "360"
           SCAN_TRIES: "1"
-          BLOCK_IMAGES: "false"
-          # 이름|시작주소|이동순서|랭킹카테고리|TOP_N|대기초
-          # 이동순서: 스크롤(스크롤3=3번) / 대기30(초) / 그 외는 위쪽 메뉴 이름
+          API_KEYWORD: ""      # 1단계 후 랭킹 API 경로 일부 입력
+          USE_API: "false"     # 2단계에서 결과가 맞으면 "true"
           RANKINGS: |
-            뷰티 랭킹|https://mobile.a-bly.com/beauty|스크롤>대기30>랭킹|뷰티|100|300
-            전체 랭킹|https://mobile.a-bly.com/beauty|스크롤>대기30>랭킹||100|
+            전체 랭킹|https://mobile.a-bly.com/ranking||100
+            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100
 
       - name: Upload debug files
         if: always()
@@ -55,5 +63,6 @@ jobs:
           path: |
             debug_*.png
             debug_*.txt
+            debug_api_*.json
           if-no-files-found: ignore
           retention-days: 3

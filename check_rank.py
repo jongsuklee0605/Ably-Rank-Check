@@ -57,6 +57,11 @@ SCROLL_ALL_JS = """(dy) => {
   return Math.round(moved);
 }"""
 
+SCROLL_TOP_JS = """() => {
+  document.querySelectorAll('*').forEach(el => { if (el.scrollTop > 0) el.scrollTop = 0; });
+  window.scrollTo(0, 0);
+}"""
+
 SCROLL_INFO_JS = """() => {
   const d = document.scrollingElement || document.documentElement;
   const out = [];
@@ -244,7 +249,7 @@ def touch_drag(cdp, x, y_from, y_to, steps=15):
     cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
 
-def do_scroll(page, cdp, dy):
+def do_scroll(page, cdp, dy, use_last=True):
     vp = page.viewport_size or {"width": 400, "height": 800}
     x = vp["width"] // 2
     top = int(vp["height"] * 0.25)
@@ -253,7 +258,7 @@ def do_scroll(page, cdp, dy):
     count = max(1, round(abs(dy) / dist))
     moved = 0
 
-    if dy > 0:
+    if dy > 0 and use_last:
         try:
             page.evaluate(LAST_ITEM_JS)
             page.wait_for_timeout(300)
@@ -297,8 +302,7 @@ def scroll_info(page):
 
 def load_rankings():
     # RANKINGS: 한 줄에 '이름|시작주소|이동순서|랭킹카테고리|TOP_N|대기초'
-    #   이동순서    : 위쪽 메뉴에서 차례로 누를 이름 (예: 뷰티>랭킹)
-    #   랭킹카테고리: 랭킹 화면 안에서 고를 탭 (비우면 기본)
+    #   이동순서: '>'로 구분. 스크롤(또는 스크롤3) / 대기30(초) / 그 외는 위쪽 메뉴 이름
     rankings = []
     for line in os.getenv("RANKINGS", "").splitlines():
         line = line.strip()
@@ -341,7 +345,12 @@ def same_page(page, url):
 
 
 def tap_menu(page, text):
-    # 위쪽 메뉴에서 해당 이름 중 가장 위에 있는 것을 누름 (사람이 메뉴를 누르는 것과 동일)
+    # 화면을 맨 위로 올린 뒤, 위쪽 메뉴에서 해당 이름 중 가장 위에 있는 것을 누름
+    try:
+        page.evaluate(SCROLL_TOP_JS)
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
     loc = page.get_by_text(text, exact=True)
     best = None
     for i in range(loc.count()):
@@ -361,6 +370,24 @@ def tap_menu(page, text):
     page.wait_for_timeout(5000)
     close_popups(page)
     log("[nav] '" + text + "' 누름 (y=" + str(round(best[0])) + ") -> url=" + page.url)
+
+
+def run_step(page, cdp, step):
+    m = re.match(r"^대기(\d+)$", step)
+    if m:
+        sec = int(m.group(1))
+        log("[nav] " + str(sec) + "초 대기")
+        page.wait_for_timeout(sec * 1000)
+        return
+    m = re.match(r"^스크롤(\d*)$", step)
+    if m:
+        n = int(m.group(1)) if m.group(1) else 1
+        for _ in range(n):
+            do_scroll(page, cdp, 1800, use_last=False)
+            page.wait_for_timeout(1500)
+        log("[nav] 스크롤 " + str(n) + "회")
+        return
+    tap_menu(page, step)
 
 
 def click_tab(page, tab, url, prev_tabs):
@@ -411,16 +438,15 @@ def click_categories(page, spec, url):
             raise RuntimeError("'" + tab + "' 카테고리를 선택하지 못했습니다.")
 
 
-def prepare_page(page, rk):
+def prepare_page(page, cdp, rk):
     rk.pop("clicked_at", None)
     open_with_retry(page, rk["url"])
     page.wait_for_timeout(4000)
     close_popups(page)
     log("[loaded] title=" + page.title() + " / url=" + page.url)
 
-    # 사람처럼 메뉴를 차례로 눌러 이동
     for step in rk["nav"]:
-        tap_menu(page, step)
+        run_step(page, cdp, step)
 
     try:
         body = page.inner_text("body")
@@ -482,7 +508,7 @@ def check_one(page, cdp, rk, idx):
     tab_txt = (" (카테고리: " + rk["tab"] + ")") if rk["tab"] else ""
     log("[open] " + rk["name"] + " : " + rk["url"] + nav_txt + tab_txt)
     try:
-        prepare_page(page, rk)
+        prepare_page(page, cdp, rk)
 
         try:
             with open("debug_text_" + str(idx) + ".txt", "w", encoding="utf-8") as f:
@@ -497,7 +523,7 @@ def check_one(page, cdp, rk, idx):
             if max_seen >= rk["top_n"] or attempt == SCAN_TRIES:
                 break
             log("[retry-scan] TOP " + str(max_seen) + "까지만 떠서 새로 이동 후 재시도")
-            prepare_page(page, rk)
+            prepare_page(page, cdp, rk)
 
         log("[" + rk["name"] + "] 확인한 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
     finally:

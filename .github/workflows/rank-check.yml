@@ -53,7 +53,7 @@ jobs:
           STALE_SEC: "120"
           MAX_SEC: "360"
           SCAN_TRIES: "1"
-          BLOCK_IMAGES: "true"
+          BLOCK_IMAGES: "false"
           # 이름|URL|카테고리|TOP_N|대기초(이 탭을 누른 뒤 몇 초 지나야 다음으로)
           RANKINGS: |
             뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100|300

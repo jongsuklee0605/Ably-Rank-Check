@@ -1,71 +1,33 @@
-name: Canmake Ably Rank Check
+import os
+import re
+import sys
+import time
+import traceback
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, parse_qs
 
-on:
-  schedule:
-    - cron: "0 * * * *"
-  workflow_dispatch:
+import requests
+from playwright.sync_api import sync_playwright
 
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # 안드로이드: chromium + "Pixel 7"  /  아이폰: webkit + "iPhone 14"
-      BROWSER: "chromium"
-      DEVICE: "Pixel 7"
-    steps:
-      - uses: actions/checkout@v4
+BRAND_NAME = os.getenv("BRAND_NAME", "Canmake")
+REPORT_TITLE = os.getenv("REPORT_TITLE", "에이블리 랭킹 체크")
+BRAND_KEYWORDS = ["캔메이크", "canmake"]
+DEFAULT_TOP_N = int(os.getenv("TOP_N", "100"))
+SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"].strip()
+HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"   # true면 슬랙 전송 안 함 (시험용)
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+# 브라우저/기기 설정
+#   BROWSER: chromium / webkit
+#   CHANNEL: chromium일 때 "chrome"이면 실제 구글 크롬 사용 (비우면 기본 크로미움)
+#   DEVICE : "Pixel 7", "iPhone 14" 등
+BROWSER = os.getenv("BROWSER", "chromium").strip().lower()
+CHANNEL = os.getenv("CHANNEL", "").strip()
+DEVICE = os.getenv("DEVICE", "Pixel 7").strip()
 
-      - name: Install Python deps
-        run: pip install -r requirements.txt
+# 불필요한 요청 차단 (통계 전송 서버만 차단, 이미지는 기본 허용)
+BLOCK_IMAGES = os.getenv("BLOCK_IMAGES", "false").lower() == "true"
+BLOCK_HOSTS = ["api2.amplitude.com"]
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ env.BROWSER }}-${{ hashFiles('requirements.txt') }}
-
-      - name: Install browser
-        run: python -m playwright install "$BROWSER"
-
-      - name: Install system deps (best effort)
-        continue-on-error: true
-        timeout-minutes: 4
-        run: |
-          for i in 1 2 3; do
-            python -m playwright install-deps "$BROWSER" && exit 0
-            echo "install-deps failed (attempt $i), retrying..."
-            sleep 15
-          done
-          exit 1
-
-      - name: Check ranking
-        run: xvfb-run -a python check_rank.py
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          MARKET_ID: "116160"
-          BRAND_NAME: "Canmake"
-          TOP_N: "100"
-          STALE_SEC: "120"
-          MAX_SEC: "360"
-          SCAN_TRIES: "1"
-          BLOCK_IMAGES: "false"
-          # 이름|URL|카테고리|TOP_N|대기초(이 탭을 누른 뒤 몇 초 지나야 다음으로)
-          RANKINGS: |
-            뷰티 랭킹|https://mobile.a-bly.com/ranking|뷰티|100|300
-            전체 랭킹|https://mobile.a-bly.com/ranking||100|
-
-      - name: Upload debug files
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-files
-          path: |
-            debug_*.png
-            debug_*.txt
-          if-no-files-found: ignore
-          retention-days: 3
+# 로딩 대기 설정
+STALE_SEC =

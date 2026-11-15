@@ -43,8 +43,8 @@ jobs:
           BLOCK_IMAGES: "false"
           # 이름|시작주소|이동순서|랭킹카테고리|TOP_N|대기초
           RANKINGS: |
-            뷰티 랭킹|https://mobile.a-bly.com/|뷰티>랭킹|뷰티|100|300
-            전체 랭킹|https://mobile.a-bly.com/|뷰티>랭킹||100|
+            뷰티 랭킹|https://mobile.a-bly.com/beauty|랭킹|뷰티|100|300
+            전체 랭킹|https://mobile.a-bly.com/beauty|랭킹||100|
 
       - name: Upload debug files
         if: always()

@@ -35,6 +35,14 @@ NUDGE_EVERY = 10                                 # 로딩 멈춤 시 위아래 �
 KST = timezone(timedelta(hours=9))
 RANK_RE = re.compile(r"^\d{1,3}$")
 SCROLL_JS = "() => { window.scrollBy(0, 1800); document.querySelectorAll('*').forEach(el => { const s = getComputedStyle(el).overflowY; if ((s === 'auto' || s === 'scroll') && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollTop + 1800; } }); }"
+# 화면에 있는 가장 큰 순위 숫자(마지막 상품)로 이동
+LAST_ITEM_JS = """() => {
+  const els = [...document.querySelectorAll('body *')].filter(e => e.children.length === 0 && /^\\d{1,3}$/.test((e.textContent || '').trim()));
+  let best = null, bv = 0;
+  for (const e of els) { const v = parseInt(e.textContent.trim()); if (v > bv) { bv = v; best = e; } }
+  if (best) best.scrollIntoView({block: 'center'});
+  return bv;
+}"""
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']});"
 STEALTH_JS_CHROME = "window.chrome = {runtime: {}};"
 CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser"]
@@ -155,34 +163,101 @@ def warm_up(context):
 
 
 def get_cdp(context, page):
-    # Chromium이면 실제 터치 스크롤(손가락 쓸기)을 쓰기 위한 세션
+    # Chromium이면 실제 터치 드래그를 쓰기 위한 세션
     if BROWSER != "chromium":
+        log("[drag] 방식: 마우스 드래그 (" + BROWSER + ")")
         return None
     try:
-        return context.new_cdp_session(page)
+        cdp = context.new_cdp_session(page)
+        log("[drag] 방식: 터치 드래그")
+        return cdp
     except Exception as e:
-        log("[touch] CDP 세션 실패(일반 스크롤 사용): " + str(e)[:80])
+        log("[drag] CDP 세션 실패, 마우스 드래그 사용: " + str(e)[:80])
         return None
+
+
+def setup_net_log(page):
+    # 랭킹 다음 묶음 요청이 실패하는지 확인하기 위한 네트워크 기록
+    seen = set()
+
+    def on_resp(r):
+        try:
+            if r.request.resource_type not in ("xhr", "fetch") or "amplitude" in r.url:
+                return
+            path = urlparse(r.url).netloc + urlparse(r.url).path
+            if r.status >= 400:
+                log("[net] 실패 " + str(r.status) + " " + r.url[:140])
+            elif path not in seen:
+                seen.add(path)
+                log("[net] " + str(r.status) + " " + path[:120])
+        except Exception:
+            pass
+
+    def on_fail(r):
+        try:
+            if r.resource_type in ("xhr", "fetch") and "amplitude" not in r.url:
+                log("[net] 요청 실패 " + r.url[:140] + " / " + str(r.failure)[:60])
+        except Exception:
+            pass
+
+    page.on("response", on_resp)
+    page.on("requestfailed", on_fail)
+
+
+def touch_drag(cdp, x, y_from, y_to, steps=15):
+    # 손가락으로 누른 채(y_from) 천천히 끌어서(y_to) 떼는 동작
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y_from}]})
+    for i in range(1, steps + 1):
+        y = y_from + (y_to - y_from) * i / steps
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x, "y": y}]})
+        time.sleep(0.02)
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
 
 def do_scroll(page, cdp, dy):
-    # dy > 0 : 아래로, dy < 0 : 위로
-    if cdp:
+    # dy > 0 : 아래 내용 보기(손가락을 위로 끌어올림), dy < 0 : 위로 되돌리기
+    vp = page.viewport_size or {"width": 400, "height": 800}
+    x = vp["width"] // 2
+    top = int(vp["height"] * 0.25)
+    bottom = int(vp["height"] * 0.80)
+    dist = bottom - top
+    count = max(1, round(abs(dy) / dist))
+
+    # 1) 아래로 갈 때는 먼저 화면의 마지막 상품으로 이동
+    if dy > 0:
         try:
-            vp = page.viewport_size or {"width": 400, "height": 800}
-            step = int(vp["height"] * 0.6)
-            moved = 0
-            while moved < abs(dy):
-                cdp.send("Input.synthesizeScrollGesture", {
-                    "x": vp["width"] // 2,
-                    "y": vp["height"] // 2,
-                    "yDistance": -step if dy > 0 else step,
-                    "speed": 3000,
-                    "gestureSourceType": "touch",
-                })
-                moved += step
+            page.evaluate(LAST_ITEM_JS)
+            page.wait_for_timeout(300)
         except Exception:
             pass
+
+    # 2) 손가락 드래그
+    dragged = False
+    if cdp:
+        try:
+            for _ in range(count):
+                if dy > 0:
+                    touch_drag(cdp, x, bottom, top)
+                else:
+                    touch_drag(cdp, x, top, bottom)
+                page.wait_for_timeout(400)
+            dragged = True
+        except Exception as e:
+            log("[drag] 터치 드래그 실패, 마우스 드래그로 대체: " + str(e)[:80])
+
+    if not dragged:
+        try:
+            for _ in range(count):
+                start_y, end_y = (bottom, top) if dy > 0 else (top, bottom)
+                page.mouse.move(x, start_y)
+                page.mouse.down()
+                page.mouse.move(x, end_y, steps=15)
+                page.mouse.up()
+                page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    # 3) 보조: 일반 스크롤
     try:
         if dy > 0:
             page.evaluate(SCROLL_JS)
@@ -190,11 +265,6 @@ def do_scroll(page, cdp, dy):
             page.evaluate("(d) => window.scrollBy(0, d)", dy)
     except Exception:
         pass
-    if not cdp:
-        try:
-            page.mouse.wheel(0, dy)
-        except Exception:
-            pass
 
 
 def load_rankings():
@@ -337,11 +407,15 @@ def scan(page, cdp, rk, hits):
             log("[scan] 최대 대기 시간(" + str(MAX_SEC) + "초) 초과, 중단")
             break
 
-        # 로딩이 멈춘 것 같으면 주기적으로 위로 올렸다 내려서 lazy load 재트리거
+        # 로딩이 멈춘 것 같으면 주기적으로 위로 올렸다 내려서 다음 묶음 로딩 재유도
         if idle >= 6 and now - last_nudge >= NUDGE_EVERY:
-            log("[scan] 대기 중... " + str(int(idle)) + "초째 TOP " + str(max_seen))
+            try:
+                y = page.evaluate("() => Math.round(window.scrollY)")
+            except Exception:
+                y = -1
+            log("[scan] 대기 중... " + str(int(idle)) + "초째 TOP " + str(max_seen) + " / 스크롤 위치=" + str(y))
             close_popups(page)
-            do_scroll(page, cdp, -2500)
+            do_scroll(page, cdp, -1500)
             page.wait_for_timeout(800)
             last_nudge = now
 
@@ -483,6 +557,7 @@ def main():
             warm_up(context)
             page = context.new_page()
             page.on("pageerror", lambda e: log("[js-error] " + str(e)[:150]))
+            setup_net_log(page)
             cdp = get_cdp(context, page)
 
             for idx, rk in enumerate(rankings, start=1):

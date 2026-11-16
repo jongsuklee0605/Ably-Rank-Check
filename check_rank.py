@@ -17,6 +17,14 @@ DEFAULT_TOP_N = int(os.getenv("TOP_N", "100"))
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"].strip()
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
+# 프록시 (GitHub Actions IP가 막힐 때 한국 IP 프록시 사용) 예: http://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+# 접속 환경: mobile(아이폰 UA) / desktop(데스크톱 UA). 막히면 desktop 으로 바꿔 시도
+CLIENT_MODE = os.getenv("CLIENT_MODE", "mobile").strip().lower()
+# 페이지가 비어 있을 때 새로고침하며 기다리는 횟수/시간
+BLANK_RELOADS = int(os.getenv("BLANK_RELOADS", "3"))
+BLANK_WAIT_SEC = int(os.getenv("BLANK_WAIT_SEC", "20"))
+
 # API 수집 설정
 MARKET_ID = os.getenv("MARKET_ID", "").strip()
 API_KEYWORD = os.getenv("API_KEYWORD", "").strip()           # 랭킹 API 주소의 일부 (찾은 뒤 입력)
@@ -30,10 +38,14 @@ NUDGE_EVERY = 10                                 # 로딩 멈춤 시 위아래 �
 
 KST = timezone(timedelta(hours=9))
 RANK_RE = re.compile(r"^\d{1,3}$")
-UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+UA_MOBILE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+UA = UA_DESKTOP if CLIENT_MODE == "desktop" else UA_MOBILE
 SCROLL_JS = "() => { window.scrollBy(0, 1800); document.querySelectorAll('*').forEach(el => { const s = getComputedStyle(el).overflowY; if ((s === 'auto' || s === 'scroll') && el.scrollHeight > el.clientHeight) { el.scrollTop = el.scrollTop + 1800; } }); }"
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
-CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser"]
+CHALLENGE_WORDS = ["잠시만 기다리", "just a moment", "attention required", "checking your browser", "access denied", "error 1020", "verify you are human"]
+CHALLENGE_BODY_WORDS = ["cloudflare", "verify you are human", "checking your browser", "enable javascript and cookies", "access denied", "사람인지 확인", "잠시만 기다리"]
+BLOCKED_MSG = "에이블리 접속 차단/빈 화면 (GitHub Actions IP 차단 가능성 - PROXY_URL 또는 self-hosted runner 필요)"
 VERIFY_WORDS = {"뷰티": ["스킨케어", "포인트 메이크업", "베이스 메이크업"]}
 MAIN_URL = "https://mobile.a-bly.com/"
 OPEN_RETRY = 3
@@ -57,7 +69,10 @@ class ApiCollector:
 
     def _on_response(self, resp):
         try:
-            if resp.request.resource_type not in ("xhr", "fetch"):
+            rt = resp.request.resource_type
+            if rt == "document" or resp.status >= 400:
+                log("[resp] " + str(resp.status) + " " + rt + " " + resp.url[:110])
+            if rt not in ("xhr", "fetch"):
                 return
             if "json" not in (resp.headers.get("content-type") or ""):
                 return
@@ -142,28 +157,60 @@ def is_brand_line(line):
     return False
 
 
-def is_challenge(page):
+class BlockedError(RuntimeError):
+    """봇 차단 / 빈 화면으로 페이지를 읽을 수 없는 상태"""
+
+
+def page_state(page):
+    """'ok' / 'challenge' / 'blank' 중 하나와 진단 문자열을 돌려준다"""
     try:
-        t = page.title().lower()
+        title = page.title().strip()
     except Exception:
-        return False
-    for w in CHALLENGE_WORDS:
-        if w in t:
-            return True
-    return False
+        title = ""
+    try:
+        body = page.inner_text("body").strip()
+    except Exception:
+        body = ""
+    tl, bl = title.lower(), body.lower()
+    if any(w in tl for w in CHALLENGE_WORDS):
+        return "challenge", title, body
+    if len(body) < 300 and any(w in bl for w in CHALLENGE_BODY_WORDS):
+        return "challenge", title, body
+    # title 도 없고 본문도 거의 없으면 차단/미로딩 화면
+    if not title and len(body) < 50:
+        return "blank", title, body
+    return "ok", title, body
+
+
+def diag(tag, page):
+    state, title, body = page_state(page)
+    log("[" + tag + "] state=" + state + " url=" + page.url[:100] + " title=" + title[:40] + " body길이=" + str(len(body)))
+    if body:
+        log("[" + tag + "] body: " + body[:200].replace("\n", " | "))
+    return state
+
+
+def is_challenge(page):
+    return page_state(page)[0] != "ok"
 
 
 def pass_challenge(page):
+    """챌린지/빈 화면이면 일정 시간 기다리고, 그래도 안 되면 BlockedError"""
     page.wait_for_timeout(3000)
-    if not is_challenge(page):
+    state = page_state(page)[0]
+    if state == "ok":
         return
-    log("[challenge] 봇 확인 화면 감지 - 통과 대기")
-    for _ in range(30):
+    log("[challenge] 비정상 화면 감지(" + state + ") - 통과 대기")
+    waited = 0
+    limit = 30 if state == "challenge" else BLANK_WAIT_SEC
+    while waited < limit:
         page.wait_for_timeout(1000)
-        if not is_challenge(page):
-            log("[challenge] 통과")
+        waited += 1
+        if page_state(page)[0] == "ok":
+            log("[challenge] 통과 (" + str(waited) + "초)")
             return
-    raise RuntimeError("에이블리 봇 확인 화면(Cloudflare)을 통과하지 못했습니다.")
+    diag("blocked", page)
+    raise BlockedError(BLOCKED_MSG)
 
 
 def open_with_retry(page, url):
@@ -178,18 +225,23 @@ def open_with_retry(page, url):
             log("[retry] " + str(attempt) + "/" + str(OPEN_RETRY) + " 접속 실패: " + str(e).split("\n")[0][:80])
             if attempt == OPEN_RETRY:
                 raise
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(5000 * attempt)
 
 
 def warm_up(context):
     page = context.new_page()
+    ApiCollector(page)   # 응답 상태코드를 로그로 남기기 위해 연결
     try:
         log("[warmup] 에이블리 메인 페이지 접속")
         open_with_retry(page, MAIN_URL)
         page.wait_for_timeout(3000)
-        log("[warmup] 완료 title=" + page.title())
+        diag("warmup", page)
     except Exception as e:
-        log("[warmup] 실패(무시하고 진행): " + str(e).split("\n")[0][:80])
+        log("[warmup] 실패(무시하고 진행): " + str(e).split("\n")[0][:120])
+        try:
+            page.screenshot(path="debug_warmup.png")
+        except Exception:
+            pass
     finally:
         page.close()
 
@@ -296,7 +348,8 @@ def prepare_page(page, rk, api=None):
         api.reset()
     open_with_retry(page, rk["url"])
     page.wait_for_timeout(4000)
-    log("[loaded] title=" + page.title())
+    if diag("loaded", page) != "ok":
+        raise BlockedError(BLOCKED_MSG)
     if rk["tab"]:
         click_categories(page, rk["tab"], rk["url"], api)
         page.evaluate("() => window.scrollTo(0, 0)")
@@ -319,6 +372,10 @@ def scan(page, rk, hits):
             break
 
         idle = now - last_progress
+        # 아무것도 못 읽었는데 화면이 차단/빈 화면이면 120초 기다리지 않고 바로 중단
+        if max_seen == 0 and now - start >= 30 and page_state(page)[0] != "ok":
+            diag("scan-blocked", page)
+            raise BlockedError(BLOCKED_MSG)
         if idle >= STALE_SEC:
             log("[scan] 로딩 멈춤 - " + str(int(idle)) + "초간 변화 없음, 중단")
             break
@@ -352,12 +409,6 @@ def check_one(context, rk, idx):
     try:
         prepare_page(page, rk, api)
 
-        try:
-            with open("debug_text_" + str(idx) + ".txt", "w", encoding="utf-8") as f:
-                f.write(page.inner_text("body"))
-        except Exception:
-            pass
-
         for attempt in range(1, SCAN_TRIES + 1):
             m = scan(page, rk, hits)
             if m > max_seen:
@@ -369,17 +420,24 @@ def check_one(context, rk, idx):
 
         log("[" + rk["name"] + "] (화면) 최대 순위=" + str(max_seen) + " / 캔메이크=" + str(sorted(hits)))
 
-        api.dump("debug_api_" + str(idx) + ".json")
         if API_KEYWORD:
             api_hits, api_max = api_ranks(api.items)
             log("[" + rk["name"] + "] (API) 최대 순위=" + str(api_max) + " / 캔메이크=" + str(sorted(api_hits)))
             if USE_API and api_max > 0:
                 hits, max_seen = api_hits, api_max
     finally:
+        # 성공/실패와 상관없이 마지막 화면 텍스트·스크린샷·API 응답을 남긴다
+        try:
+            with open("debug_text_" + str(idx) + ".txt", "w", encoding="utf-8") as f:
+                f.write("url=" + page.url + "\ntitle=" + page.title() + "\n\n" + page.inner_text("body"))
+        except Exception:
+            pass
         try:
             page.screenshot(path="debug_ranking_" + str(idx) + ".png")
         except Exception:
             pass
+        if api.items:
+            api.dump("debug_api_" + str(idx) + ".json")
         page.close()
 
     in_range = {}
@@ -422,19 +480,40 @@ def main():
         send_slack(":warning: [" + now + "] RANKINGS 설정이 비어 있습니다.")
         sys.exit(1)
 
-    log("[config] API_KEYWORD=" + (API_KEYWORD or "(없음)") + " / USE_API=" + str(USE_API) + " / MARKET_ID=" + (MARKET_ID or "(없음)"))
+    log("[config] API_KEYWORD=" + (API_KEYWORD or "(없음)") + " / USE_API=" + str(USE_API) + " / MARKET_ID=" + (MARKET_ID or "(없음)")
+        + " / CLIENT_MODE=" + CLIENT_MODE + " / PROXY=" + ("사용" if PROXY_URL else "(없음)") + " / HEADLESS=" + str(HEADLESS))
 
     sections = []
     any_hit = False
     fail_count = 0
+    blocked = False
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(viewport={"width": 430, "height": 932}, user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", is_mobile=True, has_touch=True)
+        launch_kwargs = {"headless": HEADLESS, "args": ["--disable-blink-features=AutomationControlled", "--lang=ko-KR"]}
+        if PROXY_URL:
+            pu = urlparse(PROXY_URL)
+            proxy = {"server": pu.scheme + "://" + pu.hostname + (":" + str(pu.port) if pu.port else "")}
+            if pu.username:
+                proxy["username"] = pu.username
+                proxy["password"] = pu.password or ""
+            launch_kwargs["proxy"] = proxy
+        browser = p.chromium.launch(**launch_kwargs)
+
+        if CLIENT_MODE == "desktop":
+            ctx_kwargs = {"viewport": {"width": 1280, "height": 900}}
+        else:
+            ctx_kwargs = {"viewport": {"width": 430, "height": 932}, "is_mobile": True, "has_touch": True}
+        context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul",
+                                      extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"}, **ctx_kwargs)
         context.add_init_script(STEALTH_JS)
         try:
             warm_up(context)
             for idx, rk in enumerate(rankings, start=1):
+                if blocked:
+                    # 같은 IP로는 나머지도 막히므로 시간 낭비 없이 건너뜀
+                    fail_count += 1
+                    sections.append("*[" + rk["name"] + "]* :no_entry: " + BLOCKED_MSG)
+                    continue
                 try:
                     hits, max_seen = check_one(context, rk, idx)
                     if hits:
@@ -442,6 +521,11 @@ def main():
                     if max_seen == 0 and not hits:
                         fail_count += 1
                     sections.append(format_section(rk, hits, max_seen))
+                except BlockedError as e:
+                    log("[blocked] " + rk["name"] + " : " + str(e))
+                    blocked = True
+                    fail_count += 1
+                    sections.append("*[" + rk["name"] + "]* :no_entry: " + str(e))
                 except Exception as e:
                     traceback.print_exc()
                     fail_count += 1

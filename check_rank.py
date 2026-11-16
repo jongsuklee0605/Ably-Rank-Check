@@ -19,6 +19,7 @@ KST = datetime.timezone(datetime.timedelta(hours=9))
 def capture_json():
     """페이지를 열고 스크롤하면서 받은 a-bly.com의 JSON 응답을 모두 모은다."""
     payloads = []
+    status = None
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True)
@@ -31,13 +32,20 @@ def capture_json():
                     pass
 
         page.on("response", on_response)
-        resp = page.goto(URL, wait_until="networkidle", timeout=60000)
-        status = resp.status if resp else None
+
+        try:
+            resp = page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+            status = resp.status if resp else None
+        except Exception as e:
+            print(f"페이지 로딩 오류: {e}")
+
+        page.wait_for_timeout(5000)  # 랭킹 데이터가 불러와질 시간
 
         for _ in range(SCROLLS):
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(1500)
 
+        print(f"status={status}, 받은 JSON 응답 {len(payloads)}개")
         browser.close()
     return status, payloads
 
@@ -101,10 +109,11 @@ def main():
     if DEBUG:
         with open("debug_payloads.json", "w", encoding="utf-8") as f:
             json.dump([{"url": u, "data": d} for u, d in payloads], f, ensure_ascii=False, indent=2)
-        print(f"status={status}, JSON 응답 {len(payloads)}개를 debug_payloads.json에 저장")
+        print("debug_payloads.json 저장 완료")
 
     goods = collect_goods(payloads)
     today = datetime.datetime.now(KST).strftime("%Y-%m-%d")
+    print(f"찾은 상품 {len(goods)}개")
 
     if status != 200 or not goods:
         post_slack(f":warning: {today} 에이블리 뷰티랭킹 수집 실패 (status={status}, 상품 {len(goods)}개)")
@@ -112,10 +121,9 @@ def main():
 
     hits = [(rank, g) for rank, g in enumerate(goods, 1) if is_target(g)]
 
-    if DEBUG:
-        print(f"전체 {len(goods)}개 중 캔메이크 {len(hits)}개")
-        for rank, g in hits:
-            print(f"  {rank}위 [{g['brand']}] {g['name']} {g['price']}")
+    print(f"전체 {len(goods)}개 중 캔메이크 {len(hits)}개")
+    for rank, g in hits:
+        print(f"  {rank}위 [{g['brand']}] {g['name']} {g['price']}")
 
     if not hits:
         post_slack(

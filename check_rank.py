@@ -3,7 +3,9 @@ import re
 import sys
 import json
 import time
+import random
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 
@@ -19,6 +21,14 @@ HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 # 프록시 (GitHub Actions IP가 막힐 때 한국 IP 프록시 사용) 예: http://user:pass@host:port
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+# 무료 프록시 풀: 목록(줄바꿈/쉼표 구분, host:port 형식 가능) 또는 목록을 내려주는 URL
+# 살아 있고 에이블리가 열리는 프록시만 자동으로 골라 쓰고, 중간에 막히면 다른 프록시로 교체한다
+PROXY_LIST = os.getenv("PROXY_LIST", "")
+PROXY_LIST_URL = os.getenv("PROXY_LIST_URL", "").strip()
+PROXY_PREFILTER_MAX = int(os.getenv("PROXY_PREFILTER_MAX", "300"))    # 1차 검사할 최대 개수
+PROXY_PREFILTER_SEC = int(os.getenv("PROXY_PREFILTER_SEC", "8"))      # 1차 검사(requests) 제한 시간
+PROXY_BROWSER_TRIES = int(os.getenv("PROXY_BROWSER_TRIES", "6"))      # 2차 검사(브라우저) 최대 시도
+PROXY_ROTATIONS = int(os.getenv("PROXY_ROTATIONS", "3"))              # 실행 중 프록시 교체 최대 횟수
 # 접속 환경: mobile(아이폰 UA) / desktop(데스크톱 UA). 막히면 desktop 으로 바꿔 시도
 CLIENT_MODE = os.getenv("CLIENT_MODE", "mobile").strip().lower()
 # 페이지가 비어 있을 때 새로고침하며 기다리는 횟수/시간
@@ -473,6 +483,135 @@ def send_slack(text):
     res.raise_for_status()
 
 
+# ---------------------------------------------------------------------------
+# 프록시 풀 / 브라우저 생성
+# ---------------------------------------------------------------------------
+
+def normalize_proxy(s):
+    s = s.strip()
+    if not s or s.startswith("#"):
+        return ""
+    if "://" not in s:
+        s = "http://" + s
+    return s
+
+
+def mask_proxy(url):
+    try:
+        u = urlparse(url)
+        return u.hostname + (":" + str(u.port) if u.port else "")
+    except Exception:
+        return "?"
+
+
+def to_playwright_proxy(url):
+    pu = urlparse(url)
+    proxy = {"server": pu.scheme + "://" + pu.hostname + (":" + str(pu.port) if pu.port else "")}
+    if pu.username:
+        proxy["username"] = pu.username
+        proxy["password"] = pu.password or ""
+    return proxy
+
+
+def load_proxy_candidates():
+    raw = []
+    if PROXY_LIST:
+        raw += re.split(r"[\s,]+", PROXY_LIST)
+    if PROXY_LIST_URL:
+        try:
+            r = requests.get(PROXY_LIST_URL, timeout=20)
+            r.raise_for_status()
+            raw += re.split(r"[\s,]+", r.text)
+            log("[proxy] 목록 URL에서 가져옴 (" + str(len(r.text.splitlines())) + "줄)")
+        except Exception as e:
+            log("[proxy] 목록 URL 가져오기 실패: " + str(e)[:80])
+    seen, rest = set(), []
+    for s in raw:
+        n = normalize_proxy(s)
+        if n and n not in seen:
+            seen.add(n)
+            rest.append(n)
+    random.shuffle(rest)
+    head = []
+    if PROXY_URL:
+        n = normalize_proxy(PROXY_URL)
+        head = [n]
+        rest = [x for x in rest if x != n]
+    return (head + rest)[:PROXY_PREFILTER_MAX]
+
+
+def proxy_alive(url):
+    """1차 검사: 프록시를 거쳐 에이블리 메인이 200으로 열리고 챌린지 화면이 아닌지 빠르게 확인"""
+    try:
+        r = requests.get(
+            MAIN_URL,
+            proxies={"http": url, "https": url},
+            headers={"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9"},
+            timeout=PROXY_PREFILTER_SEC,
+        )
+        low = r.text[:5000].lower()
+        if r.status_code == 200 and "just a moment" not in low and "attention required" not in low:
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def open_browser(p, proxy_url=""):
+    launch_kwargs = {"headless": HEADLESS, "args": ["--disable-blink-features=AutomationControlled", "--lang=ko-KR"]}
+    if proxy_url:
+        launch_kwargs["proxy"] = to_playwright_proxy(proxy_url)
+    browser = p.chromium.launch(**launch_kwargs)
+    if CLIENT_MODE == "desktop":
+        ctx_kwargs = {"viewport": {"width": 1280, "height": 900}}
+    else:
+        ctx_kwargs = {"viewport": {"width": 430, "height": 932}, "is_mobile": True, "has_touch": True}
+    context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul",
+                                  extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"}, **ctx_kwargs)
+    context.add_init_script(STEALTH_JS)
+    return browser, context
+
+
+def browser_ok(p, proxy_url):
+    """2차 검사: 실제 브라우저로 열었을 때 정상 화면(state=ok)이 나오는지 확인"""
+    browser = None
+    try:
+        browser, context = open_browser(p, proxy_url)
+        page = context.new_page()
+        page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(5000)
+        return page_state(page)[0] == "ok"
+    except Exception as e:
+        log("[proxy] 브라우저 검사 실패: " + str(e).split("\n")[0][:80])
+        return False
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+class ProxyPool:
+    def __init__(self, candidates):
+        log("[proxy] 후보 " + str(len(candidates)) + "개 1차 검사 시작 (최대 " + str(PROXY_PREFILTER_SEC) + "초/개, 병렬)")
+        with ThreadPoolExecutor(max_workers=30) as ex:
+            results = list(ex.map(proxy_alive, candidates))
+        self.queue = [c for c in results if c]
+        log("[proxy] 1차 통과 " + str(len(self.queue)) + "개 / " + str(len(candidates)) + "개")
+
+    def next_working(self, p):
+        tries = 0
+        while self.queue and tries < PROXY_BROWSER_TRIES:
+            url = self.queue.pop(0)
+            tries += 1
+            log("[proxy] 브라우저 검사 " + str(tries) + "/" + str(PROXY_BROWSER_TRIES) + " : " + mask_proxy(url))
+            if browser_ok(p, url):
+                log("[proxy] 사용: " + mask_proxy(url))
+                return url
+        return None
+
+
 def main():
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     rankings = load_rankings()
@@ -481,31 +620,36 @@ def main():
         sys.exit(1)
 
     log("[config] API_KEYWORD=" + (API_KEYWORD or "(없음)") + " / USE_API=" + str(USE_API) + " / MARKET_ID=" + (MARKET_ID or "(없음)")
-        + " / CLIENT_MODE=" + CLIENT_MODE + " / PROXY=" + ("사용" if PROXY_URL else "(없음)") + " / HEADLESS=" + str(HEADLESS))
+        + " / CLIENT_MODE=" + CLIENT_MODE + " / PROXY=" + ("고정" if PROXY_URL else "(없음)")
+        + " / 프록시풀=" + ("사용" if (PROXY_LIST or PROXY_LIST_URL) else "(없음)") + " / HEADLESS=" + str(HEADLESS))
 
     sections = []
+    notes = []
     any_hit = False
     fail_count = 0
     blocked = False
 
-    with sync_playwright() as p:
-        launch_kwargs = {"headless": HEADLESS, "args": ["--disable-blink-features=AutomationControlled", "--lang=ko-KR"]}
-        if PROXY_URL:
-            pu = urlparse(PROXY_URL)
-            proxy = {"server": pu.scheme + "://" + pu.hostname + (":" + str(pu.port) if pu.port else "")}
-            if pu.username:
-                proxy["username"] = pu.username
-                proxy["password"] = pu.password or ""
-            launch_kwargs["proxy"] = proxy
-        browser = p.chromium.launch(**launch_kwargs)
-
-        if CLIENT_MODE == "desktop":
-            ctx_kwargs = {"viewport": {"width": 1280, "height": 900}}
+    pool = None
+    if PROXY_LIST or PROXY_LIST_URL:
+        cands = load_proxy_candidates()
+        if cands:
+            pool = ProxyPool(cands)
         else:
-            ctx_kwargs = {"viewport": {"width": 430, "height": 932}, "is_mobile": True, "has_touch": True}
-        context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul",
-                                      extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"}, **ctx_kwargs)
-        context.add_init_script(STEALTH_JS)
+            notes.append("_프록시 후보가 비어 있어 직접 접속으로 진행_")
+
+    with sync_playwright() as p:
+        proxy_url = ""
+        if pool:
+            proxy_url = pool.next_working(p) or ""
+            if not proxy_url:
+                log("[proxy] 통과한 프록시가 없어 직접 접속으로 진행")
+                notes.append("_무료 프록시 중 에이블리가 열리는 것이 없어 직접 접속으로 시도_")
+        elif PROXY_URL:
+            proxy_url = normalize_proxy(PROXY_URL)
+        if proxy_url:
+            notes.append("_프록시: " + mask_proxy(proxy_url) + "_")
+
+        browser, context = open_browser(p, proxy_url)
         try:
             warm_up(context)
             for idx, rk in enumerate(rankings, start=1):
@@ -514,27 +658,48 @@ def main():
                     fail_count += 1
                     sections.append("*[" + rk["name"] + "]* :no_entry: " + BLOCKED_MSG)
                     continue
-                try:
-                    hits, max_seen = check_one(context, rk, idx)
-                    if hits:
-                        any_hit = True
-                    if max_seen == 0 and not hits:
+                rotations = 0
+                while True:
+                    try:
+                        hits, max_seen = check_one(context, rk, idx)
+                        if hits:
+                            any_hit = True
+                        if max_seen == 0 and not hits:
+                            fail_count += 1
+                        sections.append(format_section(rk, hits, max_seen))
+                    except BlockedError as e:
+                        if pool and rotations < PROXY_ROTATIONS:
+                            rotations += 1
+                            log("[proxy] 차단됨 - 다른 프록시로 교체 시도 (" + str(rotations) + "/" + str(PROXY_ROTATIONS) + ")")
+                            new_proxy = pool.next_working(p)
+                            if new_proxy:
+                                try:
+                                    browser.close()
+                                except Exception:
+                                    pass
+                                browser, context = open_browser(p, new_proxy)
+                                notes.append("_프록시 교체: " + mask_proxy(new_proxy) + "_")
+                                warm_up(context)
+                                continue
+                        log("[blocked] " + rk["name"] + " : " + str(e))
+                        blocked = True
                         fail_count += 1
-                    sections.append(format_section(rk, hits, max_seen))
-                except BlockedError as e:
-                    log("[blocked] " + rk["name"] + " : " + str(e))
-                    blocked = True
-                    fail_count += 1
-                    sections.append("*[" + rk["name"] + "]* :no_entry: " + str(e))
-                except Exception as e:
-                    traceback.print_exc()
-                    fail_count += 1
-                    sections.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e).split("\n")[0][:150])
+                        sections.append("*[" + rk["name"] + "]* :no_entry: " + str(e))
+                    except Exception as e:
+                        traceback.print_exc()
+                        fail_count += 1
+                        sections.append("*[" + rk["name"] + "]* :warning: 조회 실패: " + str(e).split("\n")[0][:150])
+                    break
         finally:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     head = ":tada:" if any_hit else ":mag:"
     msg = head + " [" + now + "] " + BRAND_NAME + " " + REPORT_TITLE + "\n" + "\n".join(sections)
+    if notes:
+        msg += "\n" + "\n".join(notes)
     log(msg)
     send_slack(msg)
 
